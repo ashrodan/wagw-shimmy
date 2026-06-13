@@ -1,0 +1,11 @@
+{
+  "event": "message",
+  "device_id": "61400000000:1@s.whatsapp.net",
+  "payload": {
+    "chat_id": "120363000000000000@g.us",
+    "from": "61400111222@s.whatsapp.net",
+    "body": "just chatting in the group",
+    "id": "MSG_GROUP_2",
+    "is_from_me": false
+  }
+}

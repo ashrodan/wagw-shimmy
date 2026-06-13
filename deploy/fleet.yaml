@@ -1,0 +1,20 @@
+# Fleet index: tenant id → exe.dev box host → WhatsApp account → status.
+# `fleetctl` reads and updates this file. One tenant per box (full isolation).
+#
+# status: provisioning | active | decommissioned
+#
+# Secrets are NOT stored here — only names/references. Values live in the secret store
+# (see deploy/README.md) and are materialised to /etc/*.env at provision time.
+
+tenants:
+  - id: acme
+    box: wa-acme.exe.xyz          # exe.dev box host (public); data plane stays on tailnet/localhost
+    magicdns: wa-acme             # Tailscale MagicDNS name (== tenant id, prefixed wa-)
+    wa_account: "+61400000001"    # the WhatsApp number linked on this box (informational)
+    status: active
+
+  - id: demo
+    box: wa-demo.exe.xyz
+    magicdns: wa-demo
+    wa_account: "+61400000002"
+    status: provisioning

@@ -1,0 +1,11 @@
+{
+  "event": "message",
+  "device_id": "61400000000:1@s.whatsapp.net",
+  "payload": {
+    "chat_id": "61400111222@s.whatsapp.net",
+    "from": "61400000000@s.whatsapp.net",
+    "body": "this is the bot's own echoed message",
+    "id": "MSG_FROMME_1",
+    "is_from_me": true
+  }
+}

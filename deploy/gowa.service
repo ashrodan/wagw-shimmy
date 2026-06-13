@@ -1,0 +1,36 @@
+[Unit]
+Description=GOWA (go-whatsapp-web-multidevice) — WhatsApp socket + REST :3000
+Documentation=https://github.com/aldinokemal/go-whatsapp-web-multidevice
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=wagw
+Group=wagw
+EnvironmentFile=/etc/gowa.env
+WorkingDirectory=/var/lib/wagw/gowa
+# REST on :3000, webhook out to the shim. Webhook URL / secret / events come from /etc/gowa.env:
+#   WHATSAPP_WEBHOOK=http://127.0.0.1:8080/webhook/gowa
+#   WHATSAPP_WEBHOOK_SECRET=<matches the shim's GOWA_WEBHOOK_SECRET>
+#   WHATSAPP_WEBHOOK_EVENTS=message
+ExecStart=/usr/local/bin/gowa rest --port 3000 --db-uri "file:/var/lib/wagw/gowa/whatsapp.db?_foreign_keys=on"
+
+Restart=on-failure
+RestartSec=2
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+# --- hardening ---
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ReadWritePaths=/var/lib/wagw/gowa
+LockPersonality=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+
+[Install]
+WantedBy=multi-user.target

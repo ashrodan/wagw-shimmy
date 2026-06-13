@@ -1,0 +1,32 @@
+[package]
+name = "wagw-shimmy"
+version = "0.1.0"
+edition = "2024"
+description = "WhatsApp Gateway Shim — bridges GOWA (whatsmeow) REST + HMAC webhooks to the spike-rust-agent inbound/outbound contract, applying per-tenant policy."
+license = "MIT"
+
+[lib]
+name = "wagw_shimmy"
+path = "src/lib.rs"
+
+[[bin]]
+name = "wagw-shimmy"
+path = "src/main.rs"
+
+[dependencies]
+axum = "0.8"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hmac = "0.12"
+sha2 = "0.10"
+subtle = "2"
+hex = "0.4"
+governor = "0.6"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

@@ -1,0 +1,144 @@
+#!/usr/bin/env bash
+# fleetctl — operator CLI for the wagw fleet. Run from the Mac (or the phone over the tailnet).
+#
+#   fleetctl add <id>        provision a fresh box for tenant <id>, then hand off to operator pairing
+#   fleetctl list            list tenants from fleet.yaml
+#   fleetctl status [<id>]   roll up systemctl is-active + last-inbound ts + drift vs tenant yaml
+#   fleetctl remove <id>     take a FINAL backup, stop units, wipe data, exe.dev rm, mark decommissioned
+#   fleetctl rotate <id> <secret>   rotate a WHATSAPP_* token or the restic password (re-render + restart)
+#
+# Secrets are referenced by name in tenants/<id>.yaml and resolved from the secret store at runtime
+# (see secret_get below — wire it to exe.dev store / 1Password / scp for your setup).
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+FLEET="$HERE/fleet.yaml"
+
+die() { echo "fleetctl: $*" >&2; exit 1; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# --- secret store adapter (wire to your store) ---------------------------------------------------
+# Resolve a secret NAME (e.g. "acme/whatsapp_gateway_token") to its value. Default impl reads from
+# `op` (1Password CLI) if present, else from env var SECRET_<UPPER_SNAKE>. Replace as needed.
+secret_get() {
+  local name="$1"
+  if have op; then op read "op://wagw/${name}" 2>/dev/null && return 0; fi
+  local var="SECRET_$(printf '%s' "$name" | tr 'a-z/.-' 'A-Z___')"
+  [ -n "${!var:-}" ] && { printf '%s' "${!var}"; return 0; }
+  die "no value for secret '$name' (set $var or configure op)"
+}
+
+tenant_box() { grep -E "^[[:space:]]*box:" "$HERE/tenants/$1.yaml" | head -1 | awk '{print $2}' | tr -d '"'; }
+tenant_dns() { grep -E "^[[:space:]]*magicdns:" "$HERE/tenants/$1.yaml" | head -1 | awk '{print $2}' | tr -d '"'; }
+
+# Prefer the tailnet MagicDNS name; fall back to the exe.dev public host for break-glass.
+ssh_host() { local d; d="$(tenant_dns "$1")"; [ -n "$d" ] && echo "$d" || tenant_box "$1"; }
+
+cmd_list() {
+  echo "TENANTS (fleet.yaml):"
+  grep -E "^[[:space:]]*- id:" "$FLEET" | sed -E 's/^[[:space:]]*- id:[[:space:]]*/  /'
+}
+
+cmd_status() {
+  local ids
+  if [ $# -ge 1 ]; then ids="$1"; else
+    ids="$(grep -E "^[[:space:]]*- id:" "$FLEET" | sed -E 's/^[[:space:]]*- id:[[:space:]]*//' | tr -d '"')"
+  fi
+  printf '%-12s %-10s %-10s %-10s %s\n' TENANT GOWA SHIM AGENT LAST-INBOUND
+  for id in $ids; do
+    local host; host="$(ssh_host "$id")"
+    # Tailscale SSH; -o BatchMode so a wedged box fails fast rather than prompting.
+    out="$(ssh -o BatchMode=yes -o ConnectTimeout=8 "$host" '
+      for u in gowa wagw-shimmy agent; do systemctl is-active "$u" 2>/dev/null || echo unknown; done
+      journalctl -u wagw-shimmy --no-pager -n 200 2>/dev/null | grep -o "forwarded inbound to agent" | tail -1 >/dev/null \
+        && journalctl -u wagw-shimmy --no-pager -o short-iso -n 200 2>/dev/null | grep "forwarded inbound" | tail -1 | cut -d" " -f1 \
+        || echo "-"
+    ' 2>/dev/null)" || out=$'unreachable\nunreachable\nunreachable\n-'
+    mapfile -t L <<<"$out"
+    printf '%-12s %-10s %-10s %-10s %s\n' "$id" "${L[0]:-?}" "${L[1]:-?}" "${L[2]:-?}" "${L[3]:--}"
+  done
+}
+
+cmd_add() {
+  local id="${1:?usage: fleetctl add <id>}"
+  [ -f "$HERE/tenants/$id.yaml" ] || die "tenants/$id.yaml not found — create it first"
+  echo "[add:$id] creating exe.dev box"
+  ssh exe.dev new | tee /tmp/fleet-$id-new.txt
+  echo "[add:$id] record the new box host into tenants/$id.yaml (box:) and fleet.yaml, then re-run with the host set."
+  local host; host="$(tenant_box "$id")"
+  [ -n "$host" ] || die "set box: in tenants/$id.yaml to the new host before provisioning"
+
+  echo "[add:$id] pushing repo + secrets and provisioning on $host"
+  # Push the repo (this one + the agent sibling) to the box.
+  rsync -az --delete "$HERE/.." "$host:wagw-shimmy/"
+  rsync -az --delete "$HERE/../../spike-rust-agent" "$host:spike-rust-agent/"
+
+  # Resolve secrets locally and hand them to provision.sh via the SSH environment.
+  ssh "$host" \
+    GOWA_BASIC_AUTH="$(secret_get "$id/gowa_basic_auth")" \
+    GOWA_WEBHOOK_SECRET="$(secret_get "$id/gowa_webhook_secret")" \
+    WHATSAPP_WEBHOOK_TOKEN="$(secret_get "$id/whatsapp_webhook_token")" \
+    WHATSAPP_GATEWAY_TOKEN="$(secret_get "$id/whatsapp_gateway_token")" \
+    OPENAI_BEARER_TOKEN="$(secret_get "$id/openai_bearer_token")" \
+    TAILSCALE_AUTHKEY="$(secret_get "$id/tailscale_authkey")" \
+    GOWA_BINARY_URL="${GOWA_BINARY_URL:?set GOWA_BINARY_URL to the CI GOWA artifact}" \
+    "bash wagw-shimmy/deploy/provision.sh $id"
+
+  cat <<EOF
+
+[add:$id] PROVISIONED. Operator action required (pairing is interactive):
+  1. Open GOWA on the box (tailnet): ssh $(ssh_host "$id") then browse /app/login, scan the QR
+     (or use pairing-code). whatsmeow persists the session after first pair.
+  2. Immediately take a post-pair backup so a crash can't lose the pairing:
+       ssh $(ssh_host "$id") 'bash wagw-shimmy/deploy/backup.sh $id'
+  3. Verify: fleetctl status $id   (expect gowa/shim/agent = active)
+  4. Mark status: active in fleet.yaml.
+EOF
+}
+
+cmd_remove() {
+  local id="${1:?usage: fleetctl remove <id>}"
+  local host; host="$(ssh_host "$id")"
+  read -r -p "Remove tenant '$id' on $host? A FINAL backup is taken first. Type the id to confirm: " ack
+  [ "$ack" = "$id" ] || die "confirmation mismatch; aborting"
+
+  echo "[remove:$id] final backup"
+  ssh "$host" "bash wagw-shimmy/deploy/backup.sh $id" || echo "[remove:$id] WARNING: final backup failed — review before continuing"
+  echo "[remove:$id] stopping units + wiping data dir"
+  ssh "$host" 'sudo systemctl disable --now agent wagw-shimmy gowa; sudo rm -rf /var/lib/wagw/*'
+  echo "[remove:$id] exe.dev rm"
+  ssh exe.dev rm "$(tenant_box "$id")" || echo "[remove:$id] exe.dev rm failed — remove manually"
+  echo "[remove:$id] mark status: decommissioned in fleet.yaml (manual)."
+}
+
+cmd_rotate() {
+  local id="${1:?usage: fleetctl rotate <id> <secret-name>}"; local secret="${2:?secret name}"
+  local host; host="$(ssh_host "$id")"
+  echo "[rotate:$id] rotating $secret — push new value to the store, then re-render + restart"
+  ssh "$host" \
+    GOWA_BASIC_AUTH="$(secret_get "$id/gowa_basic_auth")" \
+    GOWA_WEBHOOK_SECRET="$(secret_get "$id/gowa_webhook_secret")" \
+    WHATSAPP_WEBHOOK_TOKEN="$(secret_get "$id/whatsapp_webhook_token")" \
+    WHATSAPP_GATEWAY_TOKEN="$(secret_get "$id/whatsapp_gateway_token")" \
+    OPENAI_BEARER_TOKEN="$(secret_get "$id/openai_bearer_token")" \
+    GOWA_DEVICE_ID="$(ssh "$host" 'grep GOWA_DEVICE_ID /etc/wagw-shimmy.env | cut -d= -f2')" \
+    "cd wagw-shimmy && sudo -E bash deploy/render-env.sh $id && sudo systemctl restart gowa wagw-shimmy agent"
+  echo "[rotate:$id] done."
+}
+
+case "${1:-}" in
+  add)    shift; cmd_add "$@";;
+  list)   shift; cmd_list "$@";;
+  status) shift; cmd_status "$@";;
+  remove) shift; cmd_remove "$@";;
+  rotate) shift; cmd_rotate "$@";;
+  *) cat >&2 <<EOF
+usage: fleetctl <command>
+  add <id>                  provision a fresh box, then hand off to operator pairing
+  list                      list tenants
+  status [<id>]             roll up unit health + last-inbound + reachability
+  remove <id>               final backup, stop, wipe, exe.dev rm, decommission
+  rotate <id> <secret>      re-render env + restart after a secret change
+EOF
+    exit 2;;
+esac

@@ -1,0 +1,33 @@
+// Tailscale ACL policy for the wagw fleet, version-controlled alongside the repo.
+// Apply via the Tailscale admin console (or `tailscale` API) — this file is the source of truth.
+//
+// Model:
+//  - tag:wagw   — the fleet boxes (GOWA + shim + agent). They peer each other for fleet ops.
+//  - tag:admin  — the operator's devices (Mac, Android/Termius). May SSH to any fleet box.
+//  Tag ownership is locked so a compromised box cannot mint new tagged nodes.
+{
+  "tagOwners": {
+    // Only the operator (not any node) may apply these tags → a compromised box can't self-tag.
+    "tag:wagw":  ["autogroup:admin"],
+    "tag:admin": ["autogroup:admin"],
+  },
+
+  "acls": [
+    // Fleet boxes may peer each other (fleetctl status over the tailnet, healthz scrape).
+    { "action": "accept", "src": ["tag:wagw"],  "dst": ["tag:wagw:*"] },
+    // The operator's devices may reach any fleet box (SSH + tailnet-only healthz/status surface).
+    { "action": "accept", "src": ["tag:admin"], "dst": ["tag:wagw:*"] },
+  ],
+
+  "ssh": [
+    // Tailscale SSH: operator devices → fleet boxes as the service user. ACL-gated, no keypair.
+    {
+      "action": "accept",
+      "src":    ["tag:admin"],
+      "dst":    ["tag:wagw"],
+      "users":  ["wagw", "root"],
+    },
+  ],
+
+  // No Funnel: the fleet is never exposed to the public internet — tailnet-only by design.
+}

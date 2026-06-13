@@ -1,0 +1,15 @@
+{
+  "event": "message",
+  "device_id": "61400000000@s.whatsapp.net",
+  "payload": {
+    "id": "MSG_GROUP_1",
+    "chat_id": "120363000000000000@g.us",
+    "from": "61400111222@s.whatsapp.net",
+    "from_name": "Jane Doe",
+    "timestamp": "2026-06-13T10:35:00Z",
+    "is_from_me": false,
+    "body": "thanks bot!",
+    "replied_to_id": "OUT_BOT_1",
+    "quoted_body": "hi group"
+  }
+}

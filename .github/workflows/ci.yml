@@ -1,0 +1,46 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  GOWA_TAG: v8.7.0          # keep in lockstep with vendor/gowa submodule pin
+
+jobs:
+  shim:
+    name: shim — build, clippy, test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --all-targets    # 25 unit + 9 e2e; no network, no WA account
+
+  gowa-artifact:
+    name: gowa — build pinned binary artifact
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive          # pulls vendor/gowa @ the pinned tag
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"              # pinned toolchain → reproducible artifact
+      # Build the pinned GOWA source ONCE here; fleet boxes install this binary (no Go on prod).
+      - name: build gowa
+        working-directory: vendor/gowa/src
+        run: |
+          CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" \
+            -o "${GITHUB_WORKSPACE}/gowa-${GOWA_TAG}-linux-amd64" .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gowa-${{ env.GOWA_TAG }}-linux-amd64
+          path: gowa-${{ env.GOWA_TAG }}-linux-amd64
+          if-no-files-found: error

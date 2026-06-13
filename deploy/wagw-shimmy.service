@@ -1,0 +1,37 @@
+[Unit]
+Description=wagw-shimmy — WhatsApp Gateway Shim (GOWA ⟷ agent), :8080
+Documentation=https://github.com/ashleyrodan/wagw-shimmy
+# The shim sits between GOWA and the agent: start after GOWA, and cascade a GOWA restart
+# (PartOf) so the shim reconnects to a fresh upstream.
+Wants=network-online.target
+After=network-online.target gowa.service
+Requires=gowa.service
+PartOf=gowa.service
+
+[Service]
+Type=simple
+User=wagw
+Group=wagw
+EnvironmentFile=/etc/wagw-shimmy.env
+WorkingDirectory=/var/lib/wagw/shim
+ExecStart=/usr/local/bin/wagw-shimmy
+
+Restart=on-failure
+RestartSec=2
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+# --- hardening ---
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ReadWritePaths=/var/lib/wagw/shim
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+
+[Install]
+WantedBy=multi-user.target

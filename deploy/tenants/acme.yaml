@@ -1,0 +1,39 @@
+# Per-tenant config. Secrets are referenced by NAME only — values come from the secret store
+# (deploy/render-env.sh resolves them into /etc/*.env at 0600). Never put a secret value here.
+
+id: acme
+box: wa-acme.exe.xyz
+magicdns: wa-acme
+
+# WhatsApp device (the linked JID; filled in after pairing — informational).
+device_jid: "61400000001:1@s.whatsapp.net"
+
+# Policy — mirrors the shim's env vars.
+policy:
+  dm_policy: allowlist            # open | allowlist | off
+  dm_allow:
+    - "61400111222"
+    - "61400999000"
+  group_policy: allowlist         # off | allowlist | open
+  group_allow:
+    - "120363000000000000@g.us"
+  require_mention: true           # "mention" = reply-to-bot
+  free_response_chats: []
+  send_rate_per_min: 20
+
+# Secret NAMES in the store (values fetched at provision/render time).
+secrets:
+  gowa_basic_auth: acme/gowa_basic_auth
+  gowa_webhook_secret: acme/gowa_webhook_secret
+  whatsapp_webhook_token: acme/whatsapp_webhook_token
+  whatsapp_gateway_token: acme/whatsapp_gateway_token
+  openai_bearer_token: acme/openai_bearer_token
+  tailscale_authkey: acme/tailscale_authkey
+  restic_password: acme/restic_password
+  r2_access_key_id: acme/r2_access_key_id
+  r2_secret_access_key: acme/r2_secret_access_key
+
+# Backups.
+backup:
+  r2_bucket: wagw-backups
+  r2_prefix: acme                 # restic snapshots namespaced per tenant

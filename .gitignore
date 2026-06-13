@@ -1,0 +1,7 @@
+/target/
+/.env
+/.env.*
+!/.env.example
+*.log
+# Vendored GOWA is a submodule; its build artifacts must never be committed here.
+/vendor/gowa/build/

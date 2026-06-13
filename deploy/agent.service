@@ -1,0 +1,38 @@
+[Unit]
+Description=spike-rust-agent — Rust agent (WhatsApp channel), :3001
+Documentation=https://github.com/ashleyrodan/spike-rust-agent
+# The agent talks to the shim for outbound and receives inbound from it: start after the shim,
+# and cascade a shim restart.
+Wants=network-online.target
+After=network-online.target wagw-shimmy.service
+Requires=wagw-shimmy.service
+PartOf=wagw-shimmy.service
+
+[Service]
+Type=simple
+User=wagw
+Group=wagw
+EnvironmentFile=/etc/agent.env
+WorkingDirectory=/var/lib/wagw/agent
+# Agent on :3001 (GOWA owns :3000). WHATSAPP_GATEWAY_URL points at the shim (http://127.0.0.1:8080);
+# AGENT_CHANNELS=whatsapp. Both come from /etc/agent.env.
+ExecStart=/usr/local/bin/spike-rust-agent serve ${AGENT_BIND_ADDR}
+
+Restart=on-failure
+RestartSec=2
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+# --- hardening ---
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ReadWritePaths=/var/lib/wagw/agent
+LockPersonality=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+
+[Install]
+WantedBy=multi-user.target
