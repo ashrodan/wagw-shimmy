@@ -1,6 +1,6 @@
 [Unit]
 Description=wagw-shimmy — WhatsApp Gateway Shim (GOWA ⟷ agent), :8080
-Documentation=https://github.com/ashleyrodan/wagw-shimmy
+Documentation=https://github.com/ashrodan/wagw-shimmy
 # The shim sits between GOWA and the agent: start after GOWA, and cascade a GOWA restart
 # (PartOf) so the shim reconnects to a fresh upstream.
 Wants=network-online.target

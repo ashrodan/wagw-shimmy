@@ -1,6 +1,6 @@
 [Unit]
 Description=spike-rust-agent — Rust agent (WhatsApp channel), :3001
-Documentation=https://github.com/ashleyrodan/spike-rust-agent
+Documentation=https://github.com/ashrodan/spike-rust-agent
 # The agent talks to the shim for outbound and receives inbound from it: start after the shim,
 # and cascade a shim restart.
 Wants=network-online.target
