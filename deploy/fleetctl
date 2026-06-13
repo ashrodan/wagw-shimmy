@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # fleetctl — operator CLI for the wagw fleet. Run from the Mac (or the phone over the tailnet).
 #
-#   fleetctl add <id>        provision a fresh box for tenant <id>, then hand off to operator pairing
+#   fleetctl add <id>        provision a fresh box for tenant <id>, then hand off to pairing
+#   fleetctl pair <id>       link WhatsApp via pairing-code; capture JID → re-render → backup
 #   fleetctl list            list tenants from fleet.yaml
 #   fleetctl status [<id>]   roll up systemctl is-active + last-inbound ts + drift vs tenant yaml
 #   fleetctl remove <id>     take a FINAL backup, stop units, wipe data, exe.dev rm, mark decommissioned
@@ -33,6 +34,45 @@ tenant_dns() { grep -E "^[[:space:]]*magicdns:" "$HERE/tenants/$1.yaml" | head -
 
 # Prefer the tailnet MagicDNS name; fall back to the exe.dev public host for break-glass.
 ssh_host() { local d; d="$(tenant_dns "$1")"; [ -n "$d" ] && echo "$d" || tenant_box "$1"; }
+
+# Read a scalar / a list field out of tenants/<id>.yaml (id=$1, key=$2).
+yaml_val()  { grep -E "^[[:space:]]*$2:" "$HERE/tenants/$1.yaml" | head -1 | sed -E 's/^[^:]*:[[:space:]]*//; s/["'\'']//g'; }
+yaml_list() { sed -n "/^[[:space:]]*$2:/,/^[[:space:]]*[a-z_]*:/p" "$HERE/tenants/$1.yaml" \
+                | grep -E '^[[:space:]]+-' | sed -E 's/^[[:space:]]+-[[:space:]]*//; s/["'\'']//g' | paste -sd, -; }
+
+# Re-render /etc/*.env on the box and restart the stack. Resolves ALL secrets + policy (from the
+# tenant yaml) and the device id, so a re-render never silently resets policy to defaults — the
+# single source of truth is tenants/<id>.yaml + the secret store. Used by pair and rotate.
+#   render_remote <id> <gowa_device_id>
+render_remote() {
+  local id="$1" device_id="$2" host; host="$(ssh_host "$id")"
+  ssh "$host" \
+    GOWA_BASIC_AUTH="$(secret_get "$id/gowa_basic_auth")" \
+    GOWA_WEBHOOK_SECRET="$(secret_get "$id/gowa_webhook_secret")" \
+    WHATSAPP_WEBHOOK_TOKEN="$(secret_get "$id/whatsapp_webhook_token")" \
+    WHATSAPP_GATEWAY_TOKEN="$(secret_get "$id/whatsapp_gateway_token")" \
+    OPENAI_BEARER_TOKEN="$(secret_get "$id/openai_bearer_token")" \
+    GOWA_DEVICE_ID="$device_id" \
+    WA_DM_POLICY="$(yaml_val "$id" dm_policy)" \
+    WA_DM_ALLOW="$(yaml_list "$id" dm_allow)" \
+    WA_GROUP_POLICY="$(yaml_val "$id" group_policy)" \
+    WA_GROUP_ALLOW="$(yaml_list "$id" group_allow)" \
+    WA_REQUIRE_MENTION="$(yaml_val "$id" require_mention)" \
+    WA_FREE_RESPONSE_CHATS="$(yaml_list "$id" free_response_chats)" \
+    WA_SEND_RATE_PER_MIN="$(yaml_val "$id" send_rate_per_min)" \
+    "cd wagw-shimmy && sudo -E bash deploy/render-env.sh $id && sudo systemctl restart gowa wagw-shimmy agent"
+}
+
+# GOWA REST call over SSH (curl on the box, so it hits 127.0.0.1:3000 with basic auth).
+#   gowa_curl <id> <path>   e.g. gowa_curl acme '/devices'
+gowa_curl() {
+  local id="$1" path="$2" host ba
+  host="$(ssh_host "$id")"; ba="$(secret_get "$id/gowa_basic_auth")"
+  ssh -o BatchMode=yes "$host" "curl -fsS -u '$ba' 'http://127.0.0.1:3000${path}'"
+}
+
+# Extract the first "key":"value" string field from a JSON blob on stdin.
+json_str() { grep -oE "\"$1\":\"[^\"]*\"" | head -1 | sed -E "s/\"$1\":\"([^\"]*)\"/\1/"; }
 
 cmd_list() {
   echo "TENANTS (fleet.yaml):"
@@ -86,14 +126,71 @@ cmd_add() {
 
   cat <<EOF
 
-[add:$id] PROVISIONED. Operator action required (pairing is interactive):
-  1. Open GOWA on the box (tailnet): ssh $(ssh_host "$id") then browse /app/login, scan the QR
-     (or use pairing-code). whatsmeow persists the session after first pair.
-  2. Immediately take a post-pair backup so a crash can't lose the pairing:
-       ssh $(ssh_host "$id") 'bash wagw-shimmy/deploy/backup.sh $id'
-  3. Verify: fleetctl status $id   (expect gowa/shim/agent = active)
-  4. Mark status: active in fleet.yaml.
+[add:$id] PROVISIONED. Now pair WhatsApp (interactive — one time per tenant):
+  → fleetctl pair $id            (pairing-code flow; captures the JID, re-renders, backs up)
+    or, for the QR flow:  ssh -L 3000:127.0.0.1:3000 $(ssh_host "$id")  then open http://localhost:3000
+  After pairing: fleetctl status $id  (expect gowa/shim/agent = active), then mark status: active.
 EOF
+}
+
+# Pair WhatsApp for a tenant via GOWA's pairing-code flow, then wire the linked JID into the stack.
+# Headless-friendly (works from Termius/Android): no browser, no port-forward.
+#   fleetctl pair <id> [<e164-phone>]
+cmd_pair() {
+  local id="${1:?usage: fleetctl pair <id> [<e164-phone>]}"
+  [ -f "$HERE/tenants/$id.yaml" ] || die "tenants/$id.yaml not found"
+  local phone="${2:-}"
+  if [ -z "$phone" ]; then
+    read -r -p "[pair:$id] WhatsApp number in E.164 (e.g. 61400000001, no +): " phone
+  fi
+  phone="${phone#+}"
+  [[ "$phone" =~ ^[0-9]{6,15}$ ]] || die "phone must be E.164 digits only (no +, spaces, or dashes)"
+
+  echo "[pair:$id] requesting pairing code from GOWA…"
+  local code
+  code="$(gowa_curl "$id" "/app/login-with-code?phone=${phone}" | json_str pair_code)" \
+    || die "GOWA login-with-code failed (is gowa active? basic auth correct?)"
+  [ -n "$code" ] || die "GOWA returned no pair_code"
+
+  cat <<EOF
+
+  ┌──────────────────────────────────────────────────────────────┐
+  │  On the phone for ${phone}:
+  │    WhatsApp → Settings → Linked Devices → Link a device       │
+  │    → "Link with phone number instead" → enter:                │
+  │                                                                │
+  │            ${code}
+  │                                                                │
+  └──────────────────────────────────────────────────────────────┘
+
+[pair:$id] waiting for the link to complete (up to ~5 min)…
+EOF
+
+  # Poll /devices until a JID appears (single-device box → first non-empty jid is ours).
+  local jid="" attempt
+  for attempt in $(seq 1 60); do
+    jid="$(gowa_curl "$id" "/devices" 2>/dev/null | grep -oE '"jid":"[^"]+@[^"]+"' | head -1 | json_str jid)" || true
+    [ -n "$jid" ] && break
+    sleep 5
+  done
+  [ -n "$jid" ] || die "timed out waiting for pairing — re-run 'fleetctl pair $id' to get a fresh code"
+  echo "[pair:$id] linked ✓  JID = $jid"
+
+  # The JID is only known post-pair; record it as the source of truth and propagate.
+  echo "[pair:$id] writing device_jid into tenants/$id.yaml"
+  local f="$HERE/tenants/$id.yaml" tmp
+  tmp="$(mktemp)"
+  awk -v jid="$jid" '/^[[:space:]]*device_jid:/{sub(/:.*/, ": \"" jid "\""); done=1} {print} END{if(!done) exit 3}' "$f" > "$tmp" \
+    && mv "$tmp" "$f" || { rm -f "$tmp"; die "no 'device_jid:' key in tenants/$id.yaml to update"; }
+
+  echo "[pair:$id] re-rendering env with GOWA_DEVICE_ID + restarting stack"
+  render_remote "$id" "$jid"
+
+  echo "[pair:$id] immediate post-pair backup (so a crash can't lose the pairing)"
+  ssh "$(ssh_host "$id")" "bash wagw-shimmy/deploy/backup.sh $id" \
+    || echo "[pair:$id] WARNING: post-pair backup failed — run backup.sh manually ASAP"
+
+  echo "[pair:$id] done. Verify: fleetctl status $id"
 }
 
 cmd_remove() {
@@ -114,27 +211,24 @@ cmd_remove() {
 cmd_rotate() {
   local id="${1:?usage: fleetctl rotate <id> <secret-name>}"; local secret="${2:?secret name}"
   local host; host="$(ssh_host "$id")"
-  echo "[rotate:$id] rotating $secret — push new value to the store, then re-render + restart"
-  ssh "$host" \
-    GOWA_BASIC_AUTH="$(secret_get "$id/gowa_basic_auth")" \
-    GOWA_WEBHOOK_SECRET="$(secret_get "$id/gowa_webhook_secret")" \
-    WHATSAPP_WEBHOOK_TOKEN="$(secret_get "$id/whatsapp_webhook_token")" \
-    WHATSAPP_GATEWAY_TOKEN="$(secret_get "$id/whatsapp_gateway_token")" \
-    OPENAI_BEARER_TOKEN="$(secret_get "$id/openai_bearer_token")" \
-    GOWA_DEVICE_ID="$(ssh "$host" 'grep GOWA_DEVICE_ID /etc/wagw-shimmy.env | cut -d= -f2')" \
-    "cd wagw-shimmy && sudo -E bash deploy/render-env.sh $id && sudo systemctl restart gowa wagw-shimmy agent"
+  echo "[rotate:$id] rotating $secret — assumes the new value is already in the secret store."
+  # Preserve the already-paired device id; re-render pulls fresh secrets + policy from the source.
+  local device_id; device_id="$(ssh "$host" 'grep GOWA_DEVICE_ID /etc/wagw-shimmy.env | cut -d= -f2-')"
+  render_remote "$id" "$device_id"
   echo "[rotate:$id] done."
 }
 
 case "${1:-}" in
   add)    shift; cmd_add "$@";;
+  pair)   shift; cmd_pair "$@";;
   list)   shift; cmd_list "$@";;
   status) shift; cmd_status "$@";;
   remove) shift; cmd_remove "$@";;
   rotate) shift; cmd_rotate "$@";;
   *) cat >&2 <<EOF
 usage: fleetctl <command>
-  add <id>                  provision a fresh box, then hand off to operator pairing
+  add <id>                  provision a fresh box, then hand off to pairing
+  pair <id> [<e164-phone>]  link WhatsApp (pairing-code), capture JID, re-render, backup
   list                      list tenants
   status [<id>]             roll up unit health + last-inbound + reachability
   remove <id>               final backup, stop, wipe, exe.dev rm, decommission

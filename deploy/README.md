@@ -16,7 +16,7 @@ go over a single Tailscale tailnet; the data plane never leaves `127.0.0.1`.
 | `render-env.sh` | tenant yaml + secret store → `/etc/{gowa,wagw-shimmy,agent}.env` (0600) |
 | `gowa.service` / `wagw-shimmy.service` / `agent.service` | hardened systemd units with `After`/`Requires`/`PartOf` ordering |
 | `backup.sh` | restic → R2, per-tenant prefix; **SQLite-consistent** snapshot of the whatsmeow store |
-| `fleetctl` | operator CLI (run from Mac/phone): `add` / `list` / `status` / `remove` / `rotate` |
+| `fleetctl` | operator CLI (run from Mac/phone): `add` / `pair` / `list` / `status` / `remove` / `rotate` |
 
 ## Per-box stack
 
@@ -33,7 +33,8 @@ Ports: GOWA `:3000`, shim `:8080`, agent `:3001` — all bound to `127.0.0.1`. O
 ```sh
 # Add a tenant (creates the box, provisions, hands off to interactive pairing):
 GOWA_BINARY_URL=https://ci/artifacts/gowa-v8.7.0-linux-amd64 ./fleetctl add acme
-#   → operator scans the GOWA QR (/app/login) → ./backup.sh acme (immediate post-pair snapshot)
+./fleetctl pair acme         # link WhatsApp (pairing-code): captures JID → re-render → backup
+#   see ../docs/PAIRING.md for the QR alternative and the full auth flow
 
 ./fleetctl list
 ./fleetctl status            # all tenants: gowa/shim/agent active? last inbound? reachable?
