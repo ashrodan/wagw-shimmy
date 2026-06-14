@@ -26,6 +26,7 @@ account or external network: the e2e suite stands up in-process mock GOWA + agen
 
 - [`docs/TESTING.md`](docs/TESTING.md) — the three-tier testing checklist (automated / local E2E / acceptance) and the release ritual.
 - [`docs/HARDENING.md`](docs/HARDENING.md) — prioritised backlog (P0/P1/P2) of reliability + security work beyond the shipped shim.
+- [`docs/FIRST-NUMBER.md`](docs/FIRST-NUMBER.md) — manual runbook to stand up the first tenant by hand (proves the stack before trusting `fleetctl`).
 - [`docs/PAIRING.md`](docs/PAIRING.md) — the WhatsApp auth/pairing flow (`fleetctl pair`, QR, recovery).
 - [`docs/DECOMMISSION-BAE.md`](docs/DECOMMISSION-BAE.md) — Part C runbook (WhatsApp leaves Hermes).
 
