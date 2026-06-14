@@ -8,7 +8,7 @@ Legend: ✅ automated & passing · ⬜ manual, do before go-live · 🔁 recurri
 
 ## 1. Automated (CI gate — `cargo fmt`/`clippy -D`/`test` + GOWA build)
 
-These run on every push/PR and must stay green. 27 unit + 10 e2e.
+These run on every push/PR and must stay green. 36 unit + 16 e2e.
 
 - ✅ **HMAC verify** — sign/verify roundtrip; reject wrong secret, tampered body, missing/!hex/no-prefix header (`gowa.rs`).
 - ✅ **Inbound mapping** — group/DM payload → internal model; `from` fallback to `chat_id` for DMs (`model.rs`).
@@ -27,8 +27,12 @@ These run on every push/PR and must stay green. 27 unit + 10 e2e.
 - ✅ **E2E — reply-to-bot** summons the bot in a require-mention group; **reply lands in the group, not the sender's DM** (the chat_id-vs-from regression guard).
 - ✅ **E2E — /send bearer** required; unauthenticated send never reaches GOWA.
 - ✅ **E2E — body limit** 1 MiB body → 413, not forwarded.
-- ✅ **E2E — healthz** 200.
+- ✅ **E2E — livez/readyz** `/livez` 200 with no deps; `/readyz` 200 with healthy mock GOWA, 503 when GOWA is down.
+- ✅ **Durable forward queue** — hex filename + traversal safety, idempotent enqueue, JSON round-trip, backoff growth/clamp (`forward.rs`).
+- ✅ **E2E — durable forward** retry-then-succeed clears `pending/`; agent-down dead-letters to `dead/`; a pre-seeded file drains on startup.
+- ✅ **Secret resolution** — direct env wins over `<NAME>_FILE`; file read+trimmed when env absent; empty/missing → none; required-secret error names the variable, not the value (`config.rs`).
 - ✅ **GOWA artifact build** — vendored v8.7.0 submodule compiles clean in CI (proves the pin resolves & builds).
+- ✅ **Shell (deploy/tests)** — checksum verify accepts good/rejects bad; fleetctl invokes no `exe.dev new`/`rm` + enforces host validation; render-env writes 0600 credential files and keeps secrets out of the env file.
 
 ## 2. Local E2E — real GOWA + throwaway WA account (P2, before first tenant)
 
@@ -54,7 +58,7 @@ Mirrors the plan's verification. **Acceptance = steps 2 + 3 + 4 pass.**
 3. ⬜ **Group round-trip** — allowlisted group; plain msg stays silent under require-mention; reply-to-bot gets an answer **in the group** (assert it is NOT the sender's DM); add to `WA_FREE_RESPONSE_CHATS` → answers without mention.
 4. ⬜ **Dedup / timeout** — replay the same webhook id twice → agent invoked once; slow agent (>10 s) → no duplicate reply.
 5. ⬜ **Policy / isolation** — non-allowlisted sender/group dropped at the shim; `is_from_me` ignored; this box's data dir + WA account fully separate.
-6. ⬜ **Backup + restore** — run `backup.sh`; `restic snapshots` shows the tenant prefix incl. the whatsmeow store; **restore into a scratch box and confirm the session loads without re-pairing** (reboot ≠ re-pair, proven by restore, not snapshot existence).
+6. ⬜ **Backup + restore** — run `backup.sh`; `restic snapshots` shows the tenant prefix incl. the whatsmeow store; **restore into a scratch box and confirm the session loads without re-pairing** (reboot ≠ re-pair, proven by restore, not snapshot existence). Execute + record this in a dated `docs/acceptance-<date>.md` (scaffold: [`docs/acceptance-2026-06-14.md`](acceptance-2026-06-14.md)) — it is the readiness sign-off, not just a checkbox.
 
 ## 4. Media (P1.5 — when implemented)
 

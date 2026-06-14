@@ -14,7 +14,7 @@ schema, HMAC scheme, and DM/group sequence diagrams, and `deploy/README.md` for 
 
 ```sh
 cargo build
-cargo test                          # 27 unit + 10 e2e — no network, no WA account, no API spend
+cargo test                          # 36 unit + 16 e2e — no network, no WA account, no API spend
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all --check
 ```
