@@ -26,6 +26,7 @@ struct InboundForward<'a> {
 pub struct AgentClient {
     http: Client,
     inbound_url: String,
+    health_url: String,
     bearer: String,
 }
 
@@ -45,8 +46,21 @@ impl AgentClient {
         Ok(Self {
             http,
             inbound_url: config.agent_inbound_url.clone(),
+            health_url: config.agent_health_url.clone(),
             bearer: config.whatsapp_webhook_token.clone(),
         })
+    }
+
+    /// Optional readiness probe: a short-timeout `GET /health` (the agent exposes `/health`, not
+    /// `/healthz`). Returns `true` on any 2xx. Only called by `/readyz` when `SHIM_READYZ_PROBE_AGENT`
+    /// is set, since the agent is now a peered box rather than localhost.
+    pub async fn ping(&self) -> bool {
+        let request = self
+            .http
+            .get(&self.health_url)
+            .timeout(Duration::from_secs(2))
+            .bearer_auth(&self.bearer);
+        matches!(request.send().await, Ok(response) if response.status().is_success())
     }
 
     /// Forward an inbound message to the agent. Returns `Ok(())` on a 2xx; otherwise a descriptive

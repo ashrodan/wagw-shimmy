@@ -21,6 +21,9 @@ use crate::{
 
 type HmacSha256 = Hmac<Sha256>;
 
+/// Short bound on a readiness probe — a wedged dependency must not stall `/readyz`.
+const PING_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Verify a GOWA `X-Hub-Signature-256` header against the raw body. Returns `false` for a missing
 /// prefix, non-hex signature, or any mismatch. The comparison itself is constant-time
 /// (`Mac::verify_slice`), so this does not leak timing about how much of the signature matched.
@@ -55,6 +58,7 @@ pub fn sign(secret: &[u8], body: &[u8]) -> String {
 pub struct GowaClient {
     http: Client,
     send_url: String,
+    devices_url: String,
     device_id: String,
     basic_auth: Option<BasicAuth>,
 }
@@ -72,9 +76,22 @@ impl GowaClient {
         Ok(Self {
             http,
             send_url: format!("{}/send/message", config.gowa_url),
+            devices_url: format!("{}/devices", config.gowa_url),
             device_id: config.gowa_device_id.clone(),
             basic_auth: config.gowa_basic_auth.clone(),
         })
+    }
+
+    /// Readiness probe: a short-timeout `GET /devices` with basic auth. Returns `true` on any 2xx.
+    /// `/devices` is the same endpoint `fleetctl pair` polls and is confirmed reachable under GOWA
+    /// v8.7.0; a non-2xx, timeout, or connection failure all read as not-ready (no creds or body are
+    /// surfaced to the caller).
+    pub async fn ping(&self) -> bool {
+        let mut request = self.http.get(&self.devices_url).timeout(PING_TIMEOUT);
+        if let Some(auth) = &self.basic_auth {
+            request = request.basic_auth(&auth.user, Some(&auth.pass));
+        }
+        matches!(request.send().await, Ok(response) if response.status().is_success())
     }
 
     /// Send a text message to a JID (`phone` in GOWA's terms — it accepts a `…@g.us` group JID just

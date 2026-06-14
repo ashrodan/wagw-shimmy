@@ -95,7 +95,8 @@ async fn spawn_mock_agent() -> (String, Recorder) {
     (format!("http://{addr}"), recorder)
 }
 
-/// Spawn a mock GOWA (`POST /send/message`) that records the send body and returns a message id.
+/// Spawn a mock GOWA (`POST /send/message` + `GET /devices`) that records the send body and returns
+/// a message id. `GET /devices` answers 200 so the shim's `/readyz` GOWA probe passes.
 async fn spawn_mock_gowa(message_id: &'static str) -> (String, Recorder) {
     let recorder = Recorder::default();
     let app = Router::new()
@@ -107,6 +108,12 @@ async fn spawn_mock_gowa(message_id: &'static str) -> (String, Recorder) {
                     Json(json!({ "code": "SUCCESS", "results": { "message_id": message_id } }))
                 },
             ),
+        )
+        .route(
+            "/devices",
+            axum::routing::get(|| async {
+                Json(json!({ "results": [{ "jid": "61400000000:1@s.whatsapp.net" }] }))
+            }),
         )
         .with_state(recorder.clone());
     let addr = serve(app).await;
@@ -138,6 +145,7 @@ fn test_config(gowa_url: &str, agent_base: &str) -> Config {
         gowa_device_id: "61400000000:1@s.whatsapp.net".into(),
         gowa_webhook_secret: WEBHOOK_SECRET.into(),
         agent_inbound_url: format!("{}/whatsapp/inbound", agent_base.trim_end_matches('/')),
+        agent_health_url: format!("{}/health", agent_base.trim_end_matches('/')),
         whatsapp_webhook_token: WEBHOOK_BEARER.into(),
         whatsapp_gateway_token: GATEWAY_BEARER.into(),
         policy: PolicyConfig {
@@ -149,6 +157,7 @@ fn test_config(gowa_url: &str, agent_base: &str) -> Config {
             free_response_chats: vec![],
         },
         send_rate_per_min: 1000,
+        readyz_probe_agent: false,
         queue_dir: unique_queue_dir(),
         // Few retries + a tiny backoff so dead-letter/retry tests finish in milliseconds.
         forward_max_retries: 3,
@@ -417,6 +426,45 @@ async fn healthz_ok() {
         .unwrap();
     let resp = router.oneshot(request).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn livez_is_ok_without_any_dependency() {
+    // Liveness is process-only: it must not touch GOWA or the agent. Point both at dead ports.
+    let state = state_for("http://127.0.0.1:1", "http://127.0.0.1:1").await;
+    let router = build_router(state);
+    let request = Request::builder()
+        .uri("/livez")
+        .body(Body::empty())
+        .unwrap();
+    let resp = router.oneshot(request).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn readyz_is_ok_when_gowa_is_healthy() {
+    let (agent_url, _agent) = spawn_mock_agent().await;
+    let (gowa_url, _gowa) = spawn_mock_gowa("OUT_1").await;
+    let router = build_router(state_for(&gowa_url, &agent_url).await);
+    let request = Request::builder()
+        .uri("/readyz")
+        .body(Body::empty())
+        .unwrap();
+    let resp = router.oneshot(request).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn readyz_is_503_when_gowa_is_down() {
+    let (agent_url, _agent) = spawn_mock_agent().await;
+    // GOWA at a closed port → the /devices probe fails → not ready.
+    let router = build_router(state_for("http://127.0.0.1:1", &agent_url).await);
+    let request = Request::builder()
+        .uri("/readyz")
+        .body(Body::empty())
+        .unwrap();
+    let resp = router.oneshot(request).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
 }
 
 #[tokio::test]

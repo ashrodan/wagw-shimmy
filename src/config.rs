@@ -34,12 +34,18 @@ pub struct Config {
     pub gowa_webhook_secret: String,
     /// Full agent inbound endpoint, e.g. `http://127.0.0.1:3001/whatsapp/inbound`.
     pub agent_inbound_url: String,
+    /// Agent readiness endpoint, e.g. `http://127.0.0.1:3001/health` (the agent exposes `/health`,
+    /// not `/healthz`). Only probed by `/readyz` when `readyz_probe_agent` is set.
+    pub agent_health_url: String,
     /// Bearer the shim *sends* to the agent on inbound forward.
     pub whatsapp_webhook_token: String,
     /// Bearer the shim *requires* on its own `POST /send` (the agent presents it).
     pub whatsapp_gateway_token: String,
     pub policy: PolicyConfig,
     pub send_rate_per_min: u32,
+    /// When set, `/readyz` also probes the (now-peered) agent's `/health`. Default off: the agent is
+    /// a separate box, so probing it from readiness adds cross-box coupling.
+    pub readyz_probe_agent: bool,
     /// Durable forward-queue root; holds `pending/` + `dead/` (see `crate::forward`).
     pub queue_dir: PathBuf,
     /// Max backoff retries before an inbound forward is dead-lettered.
@@ -125,6 +131,7 @@ impl Config {
             .to_string();
         let agent_inbound_url = format!("{agent_base}/whatsapp/inbound");
         validate_url("AGENT_INBOUND_URL", &agent_inbound_url)?;
+        let agent_health_url = format!("{agent_base}/health");
 
         let whatsapp_webhook_token = required("WHATSAPP_WEBHOOK_TOKEN")?;
         let whatsapp_gateway_token = required("WHATSAPP_GATEWAY_TOKEN")?;
@@ -142,6 +149,7 @@ impl Config {
 
         let policy = PolicyConfig::from_env()?;
 
+        let readyz_probe_agent = env_bool("SHIM_READYZ_PROBE_AGENT");
         let queue_dir = PathBuf::from(env_or("SHIM_QUEUE_DIR", DEFAULT_QUEUE_DIR));
         let forward_max_retries =
             parse_u32("SHIM_FORWARD_MAX_RETRIES", DEFAULT_FORWARD_MAX_RETRIES)?;
@@ -163,10 +171,12 @@ impl Config {
             gowa_device_id,
             gowa_webhook_secret,
             agent_inbound_url,
+            agent_health_url,
             whatsapp_webhook_token,
             whatsapp_gateway_token,
             policy,
             send_rate_per_min,
+            readyz_probe_agent,
             queue_dir,
             forward_max_retries,
             forward_concurrency,

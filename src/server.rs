@@ -5,7 +5,8 @@
 //!   **durably enqueue** → mark dedup → **ack 200**; a bounded worker forwards to the agent.
 //! - `POST /send`        — outbound: bearer-verify → rate-limit → GOWA `/send/message`, record
 //!   the returned id for reply-to-bot detection.
-//! - `GET /healthz`      — liveness.
+//! - `GET /livez`        — process liveness (static); `/healthz` is an alias.
+//! - `GET /readyz`       — dependency-aware readiness (probes GOWA, optionally the agent).
 
 use axum::{
     Json, Router,
@@ -91,15 +92,45 @@ const MAX_BODY_BYTES: usize = 256 * 1024;
 /// Assemble the router. Exposed so integration tests can drive it without binding a socket.
 pub fn build_router(state: AppState) -> Router {
     Router::new()
-        .route("/healthz", get(healthz))
+        .route("/livez", get(livez))
+        .route("/healthz", get(livez)) // alias kept for existing scripts/docs
+        .route("/readyz", get(readyz))
         .route("/webhook/gowa", post(webhook_gowa))
         .route("/send", post(send))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state)
 }
 
-async fn healthz() -> impl IntoResponse {
+/// Process-only liveness: the binary is up and serving. Says nothing about dependencies.
+async fn livez() -> impl IntoResponse {
     Json(json!({ "status": "ok" }))
+}
+
+/// Dependency-aware readiness: `200` only if the required dependencies answer within a short
+/// timeout, else `503`. The body never carries credentials or raw upstream error bodies — just
+/// per-dependency `ok` booleans. GOWA is a required dep; the agent is probed only when
+/// `SHIM_READYZ_PROBE_AGENT` is set (it is a peered box, not localhost).
+async fn readyz(State(state): State<AppState>) -> Response {
+    let gowa_ok = state.gowa.ping().await;
+    let (agent_value, agent_ok) = if state.config.readyz_probe_agent {
+        let ok = state.agent.ping().await;
+        (json!({ "ok": ok }), ok)
+    } else {
+        (json!({ "skipped": true }), true)
+    };
+
+    let ready = gowa_ok && agent_ok;
+    let status = if ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    let body = json!({
+        "status": if ready { "ok" } else { "degraded" },
+        "gowa": { "ok": gowa_ok },
+        "agent": agent_value,
+    });
+    (status, Json(body)).into_response()
 }
 
 /// Inbound webhook from GOWA. Always responds fast — a 401 only when the HMAC fails, otherwise a
