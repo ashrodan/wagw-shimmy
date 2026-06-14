@@ -8,7 +8,8 @@ release tag, not modified in place. This directory holds the pin and any local p
 - **Upstream:** https://github.com/aldinokemal/go-whatsapp-web-multidevice
 - **Tag:** `v8.7.0`
 - **License:** MIT
-- **Built with:** Go 1.23 (pin the exact toolchain in CI for reproducibility)
+- **Built with:** the Go version declared in `vendor/gowa/src/go.mod` (v8.7.0 → **Go 1.25.5**). CI
+  reads it via `go-version-file`, so the toolchain tracks the pinned tag automatically.
 
 ## Adding the submodule (run once, on a machine with network)
 

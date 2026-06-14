@@ -32,7 +32,10 @@ jobs:
           submodules: recursive          # pulls vendor/gowa @ the pinned tag
       - uses: actions/setup-go@v6
         with:
-          go-version: "1.23"              # pinned toolchain → reproducible artifact
+          # Track the toolchain the pinned GOWA tag declares (v8.7.0 → go 1.25.5), so a tag bump
+          # can't silently mismatch the Go version. setup-go@v6 sets GOTOOLCHAIN=local, so the
+          # version here must satisfy go.mod (no auto-download).
+          go-version-file: vendor/gowa/src/go.mod
           cache-dependency-path: vendor/gowa/src/go.sum   # module lives in the submodule, not root
       # Build the pinned GOWA source ONCE here; fleet boxes install this binary (no Go on prod).
       - name: build gowa
