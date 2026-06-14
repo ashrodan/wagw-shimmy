@@ -33,6 +33,7 @@ Status: `[x]` done · `[ ]` open. Each item names the *why*, not just the *what*
 - [ ] **`systemd-analyze security` pass.** Run it against the three units, drive the exposure score down (add `SystemCallFilter=@system-service`, `RestrictAddressFamilies=AF_INET AF_UNIX`, `CapabilityBoundingSet=`, `IPAddressDeny`/`Allow` to localhost+tailnet).
 - [ ] **Alerting on staleness.** `fleetctl status` is pull-only. Add a cron/monitor that pages on unit-down or last-inbound older than a threshold (Tailscale admin "last seen" covers box liveness for free).
 - [ ] **Structured JSON logs + rotation.** Switch tracing to JSON for machine parsing; cap journald size per unit so a chatty tenant can't fill the disk.
+- [ ] **Make `GOWA_DEVICE_ID` optional.** It's required at boot but only known *after* pairing, forcing the awkward "pair before starting the shim" order (see FIRST-NUMBER.md). In single-device GOWA an omitted `X-Device-Id` resolves to the default device — so default it to empty and skip the header when unset, letting the shim start before the first pairing.
 
 ## P2 — opportunistic / demand-driven
 
