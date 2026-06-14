@@ -25,6 +25,13 @@ async fn run() -> Result<(), DynError> {
     let bind = config.bind;
     let state = AppState::new(config)?;
 
+    if state.config.agent_debug_sink {
+        tracing::warn!(
+            "SHIM_DEBUG_SINK is ON — inbound is logged and discarded, NOT forwarded to the agent. \
+             Disable before serving real tenant traffic."
+        );
+    }
+
     // Spawn the durable-forward worker: it drains any messages left in the queue by a prior run on
     // startup, then forwards each newly-enqueued inbound to the agent with bounded retries.
     let worker = state.spawn_forward_worker();

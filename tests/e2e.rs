@@ -158,6 +158,7 @@ fn test_config(gowa_url: &str, agent_base: &str) -> Config {
         },
         send_rate_per_min: 1000,
         readyz_probe_agent: false,
+        agent_debug_sink: false,
         queue_dir: unique_queue_dir(),
         // Few retries + a tiny backoff so dead-letter/retry tests finish in milliseconds.
         forward_max_retries: 3,
@@ -465,6 +466,53 @@ async fn readyz_is_503_when_gowa_is_down() {
         .unwrap();
     let resp = router.oneshot(request).await.unwrap();
     assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn debug_sink_drains_inbound_without_an_agent() {
+    let (gowa_url, _gowa) = spawn_mock_gowa("OUT_1").await;
+    // No agent at all — point the forward target at a dead port. Sink mode must still drain cleanly.
+    let mut config = test_config(&gowa_url, "http://127.0.0.1:1");
+    config.agent_debug_sink = true;
+    let state = AppState::new(Arc::new(config)).unwrap();
+    let queue = state.queue.clone();
+    let _worker = state.spawn_forward_worker();
+    let router = build_router(state);
+
+    assert_eq!(
+        post_webhook(&router, &fixture("dm_text.json")).await,
+        StatusCode::OK
+    );
+
+    // The forward is sunk (logged + success), so the pending file is removed and nothing dead-letters.
+    for _ in 0..50 {
+        if queue.pending_len() == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(queue.pending_len(), 0, "sink drains the pending file");
+    assert_eq!(queue.dead_len(), 0, "sink never dead-letters");
+}
+
+#[tokio::test]
+async fn readyz_reports_debug_sink() {
+    let (gowa_url, _gowa) = spawn_mock_gowa("OUT_1").await;
+    let mut config = test_config(&gowa_url, "http://127.0.0.1:1");
+    config.agent_debug_sink = true;
+    let router = build_router(AppState::new(Arc::new(config)).unwrap());
+    let request = Request::builder()
+        .uri("/readyz")
+        .body(Body::empty())
+        .unwrap();
+    let resp = router.oneshot(request).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let value: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(value["agent"]["debug_sink"], true);
+    assert_eq!(value["status"], "ok");
 }
 
 #[tokio::test]

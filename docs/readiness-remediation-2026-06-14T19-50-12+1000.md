@@ -14,7 +14,7 @@ and the local gates passed during review:
 - `cargo fmt --all --check`
 - `cargo clippy --all-targets -- -D warnings`
 - `cargo build`
-- `cargo test` after allowing loopback binds for mock e2e servers: 27 unit + 10 e2e
+- `cargo test` after allowing loopback binds for mock e2e servers: 36 unit + 16 e2e
 - `bash -n deploy/{fleetctl,provision.sh,render-env.sh,backup.sh,tailscale-up.sh}`
 
 Not ready for live tenant traffic until the P0 reliability and deployment-hardening items below are
@@ -30,6 +30,36 @@ Operator boundary:
 - Provider commands such as `ssh exe.dev new` and `ssh exe.dev rm` should be removed from project
   scripts. If a future operator wants provider lifecycle automation, it should live outside
   `wagw-shimmy` and call this repo only after a host already exists.
+
+## Implementation follow-up review
+
+After the first remediation implementation pass, the main recommendations were largely implemented:
+durable queue + bounded worker, `/livez` + `/readyz`, GOWA artifact SHA256 verification, `fleetctl`
+existing-host-only provisioning, shim `LoadCredential=`, and the acceptance scaffold.
+
+Remaining code/doc gaps from review:
+
+1. **Strict credential-file errors.** `*_FILE` secret resolution should fail fast when a file path is
+   explicitly configured but unreadable, missing, or whitespace-only. The first implementation
+   treated read errors as `None`, which is acceptable for "no file configured" but not for
+   "operator configured a credential file and it is broken". This matters especially for optional
+   `GOWA_BASIC_AUTH_FILE`: a broken file must not silently disable GOWA basic auth.
+2. **Forward enqueue/notify ordering.** The durable queue implementation should avoid notifying the
+   worker until after the inbound id has been marked in the dedup set, or it should split
+   `enqueue()` from `notify()`. Otherwise a fast worker can remove the queued file before a racing
+   same-id webhook reaches `enqueue()`, allowing a duplicate forward.
+3. **Deploy shell tests in CI.** `docs/TESTING.md` now lists `deploy/tests/*.test.sh` as automated,
+   so `.github/workflows/ci.yml` must run them. Manual local passes are useful but not enough for a
+   CI gate.
+
+Review verification at that point:
+
+- `cargo fmt --all --check`: pass
+- `cargo clippy --all-targets -- -D warnings`: pass
+- `cargo test`: pass with loopback permission, 36 unit + 16 e2e
+- `bash deploy/tests/fleetctl_boundary.test.sh`: pass
+- `bash deploy/tests/checksum_verify.test.sh`: pass
+- `bash deploy/tests/render_env_creds.test.sh`: pass
 
 ## 1. Agent-forward delivery gap
 
@@ -50,10 +80,12 @@ Proposed flow:
 2. Enqueue the allowed `Inbound` to disk under `/var/lib/wagw/shim/queue/pending/`.
 3. Atomically write as `id.tmp`, fsync best-effort, then rename to `id.json`.
 4. Mark the id in the in-memory dedup set after enqueue succeeds.
-5. Ack GOWA.
-6. A bounded worker drains pending files and calls `agent.forward`.
-7. On success, remove the pending file.
-8. On retry exhaustion, move it to `/var/lib/wagw/shim/queue/dead/` and log the path.
+5. Notify the worker only after the dedup mark is complete. A clean implementation can make
+   `enqueue()` persist only, then call `queue.notify()` from the handler after `dedup.insert_new`.
+6. Ack GOWA.
+7. A bounded worker drains pending files and calls `agent.forward`.
+8. On success, remove the pending file.
+9. On retry exhaustion, move it to `/var/lib/wagw/shim/queue/dead/` and log the path.
 
 Why this shape:
 
@@ -78,6 +110,9 @@ Implementation notes:
   issue while touching the same surface.
 - Sanitize filenames from message ids. Use hex or a small local escape helper; do not use raw ids as
   paths.
+- Do not wake the worker before the handler records the dedup mark. If notify happens inside
+  `enqueue()`, a fast worker can process and delete the file before a racing duplicate webhook sees
+  the dedup entry.
 - Consider adding `tokio`'s `fs` feature, or use blocking file IO only for the tiny enqueue path.
 
 Tests to add:
@@ -87,6 +122,7 @@ Tests to add:
 - Agent remains down: message moves to dead-letter after bounded retries.
 - Router restart with a pending file: the queue drains it on startup.
 - Duplicate webhook while item is pending: one queue item, one eventual forward.
+- Duplicate webhook racing with a very fast worker after enqueue: still one eventual forward.
 
 ## 2. Deep readiness endpoint
 
@@ -185,6 +221,9 @@ Phase 1:
 - Add shim support for `*_FILE` or systemd credential paths for:
   `GOWA_BASIC_AUTH`, `GOWA_WEBHOOK_SECRET`, `WHATSAPP_WEBHOOK_TOKEN`, and
   `WHATSAPP_GATEWAY_TOKEN`.
+- Treat an explicitly configured `<NAME>_FILE` as authoritative. If the file cannot be read or
+  trims to an empty value, startup must fail with an error naming `<NAME>_FILE`. Only an absent
+  `<NAME>_FILE` should fall through to "not configured".
 - Add equivalent support in `spike-rust-agent` for its WhatsApp/OpenAI secrets.
 - Update `wagw-shimmy.service` and `agent.service` to use `LoadCredential=`.
 
@@ -198,6 +237,8 @@ Tests to add:
 
 - Config loads each secret from direct env and from file path, with file path taking precedence only
   when the direct env is absent.
+- Config fails when `<NAME>_FILE` is explicitly set to a missing, unreadable, or whitespace-only
+  credential file.
 - Error messages still name variables, not values.
 - Render script creates secret files with mode 0600.
 
@@ -275,14 +316,40 @@ Before the first real tenant carries traffic:
 5. Confirm the session loads without re-pairing.
 6. Record the date, tenant/scratch ids, restic snapshot id, and result in a dated acceptance note.
 
+## 7. CI coverage for deploy shell tests
+
+Evidence:
+
+- `docs/TESTING.md` records the deploy shell tests as automated coverage.
+- `.github/workflows/ci.yml` currently runs Rust fmt, clippy, and `cargo test`, but not
+  `deploy/tests/*.test.sh`.
+
+Recommended solution:
+
+Add a CI step in the `shim` job:
+
+```yaml
+- name: deploy shell tests
+  run: |
+    bash deploy/tests/checksum_verify.test.sh
+    bash deploy/tests/fleetctl_boundary.test.sh
+    bash deploy/tests/render_env_creds.test.sh
+```
+
+Keep these tests network-free. They should use stubbed `ssh`/`rsync`, temp dirs, and fake secrets
+only.
+
 ## Suggested order
 
-1. Durable forward queue plus bounded worker.
-2. `/livez` and `/readyz`, then wire readiness into `fleetctl status`.
-3. GOWA checksum verification in CI and provision.
-4. Remove VM lifecycle from `fleetctl`; convert `add` into existing-host provisioning only.
-5. Credential-file support for shim and agent, then decide the GOWA path.
-6. Restore drill and manual local/tenant acceptance.
+1. Fix the queue notify/dedup race.
+2. Make configured `*_FILE` credential failures strict.
+3. Wire `deploy/tests/*.test.sh` into CI.
+4. Durable forward queue plus bounded worker.
+5. `/livez` and `/readyz`, then wire readiness into `fleetctl status`.
+6. GOWA checksum verification in CI and provision.
+7. Remove VM lifecycle from `fleetctl`; convert `add` into existing-host provisioning only.
+8. Credential-file support for shim and agent, then decide the GOWA path.
+9. Restore drill and manual local/tenant acceptance.
 
 This order removes the silent-loss risk first, then improves observability, then closes deployment
 supply-chain and operator-flow risks.

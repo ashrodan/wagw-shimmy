@@ -112,7 +112,11 @@ async fn livez() -> impl IntoResponse {
 /// `SHIM_READYZ_PROBE_AGENT` is set (it is a peered box, not localhost).
 async fn readyz(State(state): State<AppState>) -> Response {
     let gowa_ok = state.gowa.ping().await;
-    let (agent_value, agent_ok) = if state.config.readyz_probe_agent {
+    let (agent_value, agent_ok) = if state.config.agent_debug_sink {
+        // No agent target — forwards go to the debug sink. Surface it so a monitor (or a human)
+        // can't mistake a sink-mode box for one wired to a real agent.
+        (json!({ "debug_sink": true }), true)
+    } else if state.config.readyz_probe_agent {
         let ok = state.agent.ping().await;
         (json!({ "ok": ok }), ok)
     } else {

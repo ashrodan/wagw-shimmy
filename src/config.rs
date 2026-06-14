@@ -46,6 +46,11 @@ pub struct Config {
     /// When set, `/readyz` also probes the (now-peered) agent's `/health`. Default off: the agent is
     /// a separate box, so probing it from readiness adds cross-box coupling.
     pub readyz_probe_agent: bool,
+    /// Debug sink mode (`SHIM_DEBUG_SINK`): run the gateway with **no agent target**. Inbound still
+    /// flows through HMAC → parse → policy → durable queue, but the forward is logged and discarded
+    /// instead of POSTed to the agent (so nothing dead-letters). Used to validate the GOWA⟷shim
+    /// connection before the agent is wired. Never enable in front of real tenant traffic.
+    pub agent_debug_sink: bool,
     /// Durable forward-queue root; holds `pending/` + `dead/` (see `crate::forward`).
     pub queue_dir: PathBuf,
     /// Max backoff retries before an inbound forward is dead-lettered.
@@ -150,6 +155,7 @@ impl Config {
         let policy = PolicyConfig::from_env()?;
 
         let readyz_probe_agent = env_bool("SHIM_READYZ_PROBE_AGENT");
+        let agent_debug_sink = env_bool("SHIM_DEBUG_SINK");
         let queue_dir = PathBuf::from(env_or("SHIM_QUEUE_DIR", DEFAULT_QUEUE_DIR));
         let forward_max_retries =
             parse_u32("SHIM_FORWARD_MAX_RETRIES", DEFAULT_FORWARD_MAX_RETRIES)?;
@@ -177,6 +183,7 @@ impl Config {
             policy,
             send_rate_per_min,
             readyz_probe_agent,
+            agent_debug_sink,
             queue_dir,
             forward_max_retries,
             forward_concurrency,

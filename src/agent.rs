@@ -5,6 +5,9 @@
 //! This call is driven by the durable forward worker (`crate::forward`) **after** the webhook has
 //! already been acked 200 (see `server.rs`). Its `Result` drives the worker's retry/dead-letter
 //! decision rather than being propagated to GOWA, which must not see the agent's latency.
+//!
+//! When `SHIM_DEBUG_SINK` is set, `forward` short-circuits to a logging sink (no agent target): it
+//! records the contract it would have sent and returns `Ok`, so the queue drains without an agent.
 
 use reqwest::Client;
 use serde::Serialize;
@@ -28,6 +31,8 @@ pub struct AgentClient {
     inbound_url: String,
     health_url: String,
     bearer: String,
+    /// Debug sink mode: log the forward and succeed instead of calling the agent (see `Config`).
+    debug_sink: bool,
 }
 
 impl AgentClient {
@@ -48,6 +53,7 @@ impl AgentClient {
             inbound_url: config.agent_inbound_url.clone(),
             health_url: config.agent_health_url.clone(),
             bearer: config.whatsapp_webhook_token.clone(),
+            debug_sink: config.agent_debug_sink,
         })
     }
 
@@ -67,6 +73,20 @@ impl AgentClient {
     /// error the caller logs. The shim never retries here — GOWA's own retry plus inbound dedup is
     /// the delivery-guarantee layer.
     pub async fn forward(&self, inbound: &Inbound) -> Result<(), DynError> {
+        // Debug sink: no agent target. Log the exact contract that *would* be forwarded and report
+        // success so the durable queue drains cleanly (nothing dead-letters). Validates the
+        // GOWA⟷shim leg in isolation. `body` is message content, not a secret.
+        if self.debug_sink {
+            tracing::info!(
+                chat_id = %inbound.chat_id,
+                id = %inbound.id,
+                from_me = inbound.is_from_me,
+                body = %inbound.body,
+                "DEBUG SINK: accepted inbound (no agent target) — would forward this contract"
+            );
+            return Ok(());
+        }
+
         let body = InboundForward {
             chat_id: &inbound.chat_id,
             body: &inbound.body,
