@@ -1,12 +1,17 @@
 #!/usr/bin/env bash
 # fleetctl — operator CLI for the wagw fleet. Run from the Mac (or the phone over the tailnet).
 #
-#   fleetctl add <id>        provision a fresh box for tenant <id>, then hand off to pairing
+# This tool NEVER creates or destroys VMs. VM lifecycle is an external/manual step: create the box
+# (and set its box:/magicdns: in tenants/<id>.yaml) outside this repo, then point fleetctl at it.
+#
+#   fleetctl provision <id>  provision the app stack onto an EXISTING, reachable box, then hand off
 #   fleetctl pair <id>       link WhatsApp via pairing-code; capture JID → re-render → backup
 #   fleetctl list            list tenants from fleet.yaml
-#   fleetctl status [<id>]   roll up systemctl is-active + last-inbound ts + drift vs tenant yaml
-#   fleetctl remove <id>     take a FINAL backup, stop units, wipe data, exe.dev rm, mark decommissioned
+#   fleetctl status [<id>]   roll up systemctl is-active + /readyz + last-inbound ts
+#   fleetctl remove <id>     take a FINAL backup, stop units, wipe APP DATA (the VM is left intact)
 #   fleetctl rotate <id> <secret>   rotate a WHATSAPP_* token or the restic password (re-render + restart)
+#
+# `add` is a back-compat alias for `provision` (it no longer creates a box).
 #
 # Secrets are referenced by name in tenants/<id>.yaml and resolved from the secret store at runtime
 # (see secret_get below — wire it to exe.dev store / 1Password / scp for your setup).
@@ -34,6 +39,24 @@ tenant_dns() { grep -E "^[[:space:]]*magicdns:" "$HERE/tenants/$1.yaml" | head -
 
 # Prefer the tailnet MagicDNS name; fall back to the exe.dev public host for break-glass.
 ssh_host() { local d; d="$(tenant_dns "$1")"; [ -n "$d" ] && echo "$d" || tenant_box "$1"; }
+
+# Resolve + reachability-check a tenant's host before any remote action. Sets the global HOST.
+# This repo does not create VMs: a missing box:/magicdns: or an unreachable host is a hard stop with
+# instructions to create/fix the VM outside this repo. Uses only non-destructive checks.
+preflight_host() {
+  local id="$1"
+  [ -f "$HERE/tenants/$id.yaml" ] || die "tenants/$id.yaml not found — create it first"
+  HOST="$(ssh_host "$id")"
+  [ -n "$HOST" ] \
+    || die "tenant '$id' has no box:/magicdns: in tenants/$id.yaml — create the VM outside this repo, then set its host"
+  # Optional MagicDNS sanity check (best-effort; the ssh probe below is the real gate).
+  local dns; dns="$(tenant_dns "$id")"
+  if [ -n "$dns" ] && have tailscale && ! tailscale ip "$dns" >/dev/null 2>&1; then
+    echo "fleetctl: warning: MagicDNS '$dns' did not resolve on this tailnet (trying ssh anyway)" >&2
+  fi
+  ssh -o BatchMode=yes -o ConnectTimeout=8 "$HOST" true 2>/dev/null \
+    || die "host '$HOST' (tenant '$id') is unreachable — create or fix the VM outside this repo; fleetctl never creates boxes"
+}
 
 # Read a scalar / a list field out of tenants/<id>.yaml (id=$1, key=$2).
 yaml_val()  { grep -E "^[[:space:]]*$2:" "$HERE/tenants/$1.yaml" | head -1 | sed -E 's/^[^:]*:[[:space:]]*//; s/["'\'']//g'; }
@@ -103,22 +126,19 @@ cmd_status() {
   done
 }
 
-cmd_add() {
-  local id="${1:?usage: fleetctl add <id>}"
-  [ -f "$HERE/tenants/$id.yaml" ] || die "tenants/$id.yaml not found — create it first"
-  echo "[add:$id] creating exe.dev box"
-  ssh exe.dev new | tee /tmp/fleet-$id-new.txt
-  echo "[add:$id] record the new box host into tenants/$id.yaml (box:) and fleet.yaml, then re-run with the host set."
-  local host; host="$(tenant_box "$id")"
-  [ -n "$host" ] || die "set box: in tenants/$id.yaml to the new host before provisioning"
+# Provision the app stack onto an EXISTING, reachable box. Does NOT create the VM — preflight_host
+# hard-stops if the host is undeclared or unreachable, with instructions to create it externally.
+cmd_provision() {
+  local id="${1:?usage: fleetctl provision <id>}"
+  preflight_host "$id"   # sets HOST; dies if no box:/magicdns: or unreachable
 
-  echo "[add:$id] pushing repo + secrets and provisioning on $host"
+  echo "[provision:$id] host $HOST reachable — pushing repo + secrets and provisioning"
   # Push the repo (this one + the agent sibling) to the box.
-  rsync -az --delete "$HERE/.." "$host:wagw-shimmy/"
-  rsync -az --delete "$HERE/../../spike-rust-agent" "$host:spike-rust-agent/"
+  rsync -az --delete "$HERE/.." "$HOST:wagw-shimmy/"
+  rsync -az --delete "$HERE/../../spike-rust-agent" "$HOST:spike-rust-agent/"
 
   # Resolve secrets locally and hand them to provision.sh via the SSH environment.
-  ssh "$host" \
+  ssh "$HOST" \
     GOWA_BASIC_AUTH="$(secret_get "$id/gowa_basic_auth")" \
     GOWA_WEBHOOK_SECRET="$(secret_get "$id/gowa_webhook_secret")" \
     WHATSAPP_WEBHOOK_TOKEN="$(secret_get "$id/whatsapp_webhook_token")" \
@@ -131,10 +151,10 @@ cmd_add() {
 
   cat <<EOF
 
-[add:$id] PROVISIONED. Now pair WhatsApp (interactive — one time per tenant):
+[provision:$id] PROVISIONED. Now pair WhatsApp (interactive — one time per tenant):
   → fleetctl pair $id            (pairing-code flow; captures the JID, re-renders, backs up)
-    or, for the QR flow:  ssh -L 3000:127.0.0.1:3000 $(ssh_host "$id")  then open http://localhost:3000
-  After pairing: fleetctl status $id  (expect gowa/shim/agent = active), then mark status: active.
+    or, for the QR flow:  ssh -L 3000:127.0.0.1:3000 $HOST  then open http://localhost:3000
+  After pairing: fleetctl status $id  (expect gowa/shim/agent = active, READY = ready), then mark status: active.
 EOF
 }
 
@@ -198,45 +218,46 @@ EOF
   echo "[pair:$id] done. Verify: fleetctl status $id"
 }
 
+# Remove the APP STACK + app-owned data from a box. Does NOT destroy the VM — that final step is a
+# manual/external infra action (this repo never runs provider lifecycle).
 cmd_remove() {
   local id="${1:?usage: fleetctl remove <id>}"
-  local host; host="$(ssh_host "$id")"
-  read -r -p "Remove tenant '$id' on $host? A FINAL backup is taken first. Type the id to confirm: " ack
+  preflight_host "$id"   # sets HOST; must be reachable to back up + stop + wipe
+  read -r -p "Remove tenant '$id' APP DATA on $HOST? A FINAL backup is taken first, then gowa/shim/agent are stopped and /var/lib/wagw is wiped. The VM itself is left intact (destroy it outside this repo). Type the id to confirm: " ack
   [ "$ack" = "$id" ] || die "confirmation mismatch; aborting"
 
   echo "[remove:$id] final backup"
-  ssh "$host" "bash wagw-shimmy/deploy/backup.sh $id" || echo "[remove:$id] WARNING: final backup failed — review before continuing"
-  echo "[remove:$id] stopping units + wiping data dir"
-  ssh "$host" 'sudo systemctl disable --now agent wagw-shimmy gowa; sudo rm -rf /var/lib/wagw/*'
-  echo "[remove:$id] exe.dev rm"
-  ssh exe.dev rm "$(tenant_box "$id")" || echo "[remove:$id] exe.dev rm failed — remove manually"
-  echo "[remove:$id] mark status: decommissioned in fleet.yaml (manual)."
+  ssh "$HOST" "bash wagw-shimmy/deploy/backup.sh $id" || echo "[remove:$id] WARNING: final backup failed — review before continuing"
+  echo "[remove:$id] stopping units + wiping app data dir"
+  ssh "$HOST" 'sudo systemctl disable --now agent wagw-shimmy gowa; sudo rm -rf /var/lib/wagw/*'
+  echo "[remove:$id] app data removed. The VM still exists — destroy it outside this repo, then mark status: decommissioned in fleet.yaml (manual)."
 }
 
 cmd_rotate() {
   local id="${1:?usage: fleetctl rotate <id> <secret-name>}"; local secret="${2:?secret name}"
-  local host; host="$(ssh_host "$id")"
+  preflight_host "$id"   # sets HOST; dies if no box:/magicdns: or unreachable
   echo "[rotate:$id] rotating $secret — assumes the new value is already in the secret store."
   # Preserve the already-paired device id; re-render pulls fresh secrets + policy from the source.
-  local device_id; device_id="$(ssh "$host" 'grep GOWA_DEVICE_ID /etc/wagw-shimmy.env | cut -d= -f2-')"
+  local device_id; device_id="$(ssh "$HOST" 'grep GOWA_DEVICE_ID /etc/wagw-shimmy.env | cut -d= -f2-')"
   render_remote "$id" "$device_id"
   echo "[rotate:$id] done."
 }
 
 case "${1:-}" in
-  add)    shift; cmd_add "$@";;
-  pair)   shift; cmd_pair "$@";;
-  list)   shift; cmd_list "$@";;
-  status) shift; cmd_status "$@";;
-  remove) shift; cmd_remove "$@";;
-  rotate) shift; cmd_rotate "$@";;
+  provision) shift; cmd_provision "$@";;
+  add)       shift; cmd_provision "$@";;  # back-compat alias — provisions an existing box (never creates one)
+  pair)      shift; cmd_pair "$@";;
+  list)      shift; cmd_list "$@";;
+  status)    shift; cmd_status "$@";;
+  remove)    shift; cmd_remove "$@";;
+  rotate)    shift; cmd_rotate "$@";;
   *) cat >&2 <<EOF
-usage: fleetctl <command>
-  add <id>                  provision a fresh box, then hand off to pairing
+usage: fleetctl <command>   (this tool never creates or destroys VMs — do that outside this repo)
+  provision <id>            provision the app stack onto an EXISTING, reachable box, then hand off to pairing
   pair <id> [<e164-phone>]  link WhatsApp (pairing-code), capture JID, re-render, backup
   list                      list tenants
-  status [<id>]             roll up unit health + last-inbound + reachability
-  remove <id>               final backup, stop, wipe, exe.dev rm, decommission
+  status [<id>]             roll up unit health + /readyz + last-inbound + reachability
+  remove <id>               final backup, stop units, wipe APP DATA (VM left intact)
   rotate <id> <secret>      re-render env + restart after a secret change
 EOF
     exit 2;;

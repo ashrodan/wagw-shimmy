@@ -4,19 +4,24 @@ Self-contained provisioning for the exe.dev fleet. **One tenant per box**, full 
 localhost-wired systemd units (`gowa` → `wagw-shimmy` → `agent`). Operator access and fleet peering
 go over a single Tailscale tailnet; the data plane never leaves `127.0.0.1`.
 
+> **Operator boundary.** This tooling **never creates or destroys VMs**. Creating the box (and
+> setting its `box:`/`magicdns:` in `tenants/<id>.yaml`) and the final VM destroy are external/manual
+> infra steps. `fleetctl` only provisions the app stack onto an already-declared, reachable host,
+> pairs it, checks its health, and manages app-owned data.
+
 ## Files
 
 | file | what |
 |------|------|
 | `fleet.yaml` | tenant index: id → box host → wa account → status |
 | `tenants/<id>.yaml` | per-tenant: box, device jid, policy, secret **names**, backup prefix |
-| `provision.sh` | on-box: tailnet join → Rust toolchain → prebuilt GOWA → build shim+agent → render env → install+enable units. **Idempotent.** |
+| `provision.sh` | on-box: tailnet join → Rust toolchain → prebuilt GOWA (checksum-verified) → build shim+agent → render env → install+enable units. **Idempotent.** |
 | `tailscale-up.sh` | idempotent tailnet join (ephemeral, tagged key; MagicDNS host = tenant id; Tailscale SSH) |
 | `tailscale-acl.hujson` | version-controlled tailnet ACL (tag:wagw peers; tag:admin SSH; tag ownership locked) |
 | `render-env.sh` | tenant yaml + secret store → `/etc/{gowa,wagw-shimmy,agent}.env` (0600) |
 | `gowa.service` / `wagw-shimmy.service` / `agent.service` | hardened systemd units with `After`/`Requires`/`PartOf` ordering |
 | `backup.sh` | restic → R2, per-tenant prefix; **SQLite-consistent** snapshot of the whatsmeow store |
-| `fleetctl` | operator CLI (run from Mac/phone): `add` / `pair` / `list` / `status` / `remove` / `rotate` |
+| `fleetctl` | operator CLI (run from Mac/phone): `provision` / `pair` / `list` / `status` / `rotate` / `remove` (no VM lifecycle; `add` is a back-compat alias for `provision`) |
 
 ## Per-box stack
 
@@ -31,17 +36,24 @@ Ports: GOWA `:3000`, shim `:8080`, agent `:3001` — all bound to `127.0.0.1`. O
 ## Lifecycle
 
 ```sh
-# Add a tenant (creates the box, provisions, hands off to interactive pairing):
-GOWA_BINARY_URL=https://ci/artifacts/gowa-v8.7.0-linux-amd64 ./fleetctl add acme
+# 0. PREREQUISITE (outside this repo): create the VM and set its box:/magicdns: in tenants/acme.yaml.
+#    fleetctl never creates a box — provision fails fast if the host is undeclared or unreachable.
+
+# Provision the app stack onto the existing, reachable box, then hand off to interactive pairing.
+# GOWA_BINARY_SHA256 is the artifact's published checksum (provision aborts on mismatch).
+GOWA_BINARY_URL=https://ci/artifacts/gowa-v8.7.0-linux-amd64 \
+GOWA_BINARY_SHA256=<sha256-of-the-artifact> \
+  ./fleetctl provision acme
 ./fleetctl pair acme         # link WhatsApp (pairing-code): captures JID → re-render → backup
 #   see ../docs/PAIRING.md for the QR alternative and the full auth flow
 
 ./fleetctl list
-./fleetctl status            # all tenants: gowa/shim/agent active? last inbound? reachable?
+./fleetctl status            # all tenants: gowa/shim/agent active? /readyz? last inbound? reachable?
 ./fleetctl status acme
 
 ./fleetctl rotate acme whatsapp_gateway_token   # re-render env + restart after a secret change
-./fleetctl remove acme       # final backup → stop → wipe → exe.dev rm → decommission
+./fleetctl remove acme       # final backup → stop units → wipe APP DATA (the VM is left intact;
+                             # destroy it outside this repo, then mark decommissioned)
 ```
 
 ## Secrets

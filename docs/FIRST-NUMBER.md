@@ -157,8 +157,13 @@ sqlite3 whatsapp.db ".backup 'whatsapp-firstpair.db'"     # copy this off-box
 ## 8. Promote (later)
 
 Once the manual run is solid: move the env files to `/etc/*.env` (0600), install the three systemd
-units (`deploy/*.service`), and from then on use `fleetctl add` / `fleetctl pair` for subsequent
+units (`deploy/*.service`), and from then on use `fleetctl provision` / `fleetctl pair` for subsequent
 numbers. The manual run is the reference the automation should reproduce.
+
+> **VM creation stays manual.** `fleetctl` never creates or destroys boxes — that is an
+> operator/infra prerequisite. Create the VM (and record its `box:`/`magicdns:` in
+> `deploy/tenants/<id>.yaml`) first; `fleetctl provision <id>` only stands the app stack up on an
+> already-declared, reachable host.
 
 ## Gotchas seen / to watch
 
