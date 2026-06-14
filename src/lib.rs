@@ -19,6 +19,7 @@ pub mod agent;
 pub mod config;
 pub mod dedup;
 pub mod error;
+pub mod forward;
 pub mod gowa;
 pub mod model;
 pub mod policy;

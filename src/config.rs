@@ -3,7 +3,7 @@
 //! validation errors name the offending *variable*, never its value.
 
 use reqwest::Url;
-use std::{env, net::SocketAddr};
+use std::{env, net::SocketAddr, path::PathBuf, time::Duration};
 
 use crate::error::DynError;
 
@@ -11,6 +11,12 @@ pub const DEFAULT_BIND: &str = "127.0.0.1:8080";
 pub const DEFAULT_GOWA_URL: &str = "http://127.0.0.1:3000";
 pub const DEFAULT_AGENT_URL: &str = "http://127.0.0.1:3001";
 pub const DEFAULT_SEND_RATE_PER_MIN: u32 = 20;
+
+/// Durable forward-queue defaults (see `crate::forward`).
+pub const DEFAULT_QUEUE_DIR: &str = "/var/lib/wagw/shim/queue";
+pub const DEFAULT_FORWARD_MAX_RETRIES: u32 = 5;
+pub const DEFAULT_FORWARD_CONCURRENCY: usize = 4;
+pub const DEFAULT_FORWARD_BACKOFF_MS: u64 = 1000;
 
 /// Suffix of a WhatsApp DM (one-to-one) JID.
 pub const DM_SUFFIX: &str = "@s.whatsapp.net";
@@ -34,6 +40,14 @@ pub struct Config {
     pub whatsapp_gateway_token: String,
     pub policy: PolicyConfig,
     pub send_rate_per_min: u32,
+    /// Durable forward-queue root; holds `pending/` + `dead/` (see `crate::forward`).
+    pub queue_dir: PathBuf,
+    /// Max backoff retries before an inbound forward is dead-lettered.
+    pub forward_max_retries: u32,
+    /// Bound on concurrent agent forwards drained from the queue.
+    pub forward_concurrency: usize,
+    /// Base backoff between forward retries (doubles each attempt, capped internally).
+    pub forward_backoff: Duration,
 }
 
 /// GOWA HTTP basic-auth pair, parsed from `user:pass`.
@@ -128,6 +142,20 @@ impl Config {
 
         let policy = PolicyConfig::from_env()?;
 
+        let queue_dir = PathBuf::from(env_or("SHIM_QUEUE_DIR", DEFAULT_QUEUE_DIR));
+        let forward_max_retries =
+            parse_u32("SHIM_FORWARD_MAX_RETRIES", DEFAULT_FORWARD_MAX_RETRIES)?;
+        let forward_concurrency = usize::try_from(parse_u32(
+            "SHIM_FORWARD_CONCURRENCY",
+            DEFAULT_FORWARD_CONCURRENCY as u32,
+        )?)
+        .unwrap_or(DEFAULT_FORWARD_CONCURRENCY)
+        .max(1);
+        let forward_backoff = Duration::from_millis(parse_u64(
+            "SHIM_FORWARD_BACKOFF_MS",
+            DEFAULT_FORWARD_BACKOFF_MS,
+        )?);
+
         Ok(Self {
             bind,
             gowa_url,
@@ -139,6 +167,10 @@ impl Config {
             whatsapp_gateway_token,
             policy,
             send_rate_per_min,
+            queue_dir,
+            forward_max_retries,
+            forward_concurrency,
+            forward_backoff,
         })
     }
 }
@@ -248,6 +280,26 @@ fn list(name: &str) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Parse an optional non-negative integer env var, falling back to `default` when unset. An
+/// explicitly-set but unparseable value is an error (fail fast) rather than a silent default.
+fn parse_u32(name: &str, default: u32) -> Result<u32, DynError> {
+    match optional(name) {
+        Some(raw) => raw
+            .parse::<u32>()
+            .map_err(|_| boxed(format!("{name} must be a non-negative integer"))),
+        None => Ok(default),
+    }
+}
+
+fn parse_u64(name: &str, default: u64) -> Result<u64, DynError> {
+    match optional(name) {
+        Some(raw) => raw
+            .parse::<u64>()
+            .map_err(|_| boxed(format!("{name} must be a non-negative integer"))),
+        None => Ok(default),
+    }
 }
 
 fn validate_url(name: &str, value: &str) -> Result<(), DynError> {

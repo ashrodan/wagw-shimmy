@@ -24,7 +24,10 @@ async fn run() -> Result<(), DynError> {
     let config = Arc::new(Config::from_env()?);
     let bind = config.bind;
     let state = AppState::new(config)?;
-    let tasks = state.tasks.clone();
+
+    // Spawn the durable-forward worker: it drains any messages left in the queue by a prior run on
+    // startup, then forwards each newly-enqueued inbound to the agent with bounded retries.
+    let worker = state.spawn_forward_worker();
 
     let app = build_router(state);
     let listener = TcpListener::bind(bind).await?;
@@ -35,17 +38,10 @@ async fn run() -> Result<(), DynError> {
         .with_graceful_shutdown(shutdown_signal())
         .await?;
 
-    // The HTTP server has stopped accepting; drain spawned inbound-forward tasks so an in-flight
-    // agent delivery isn't dropped on the floor at shutdown. Bounded so a wedged agent can't block
-    // exit forever.
-    tracing::info!("draining in-flight inbound forwards");
-    tasks.close();
-    tokio::select! {
-        _ = tasks.wait() => tracing::info!("drain complete"),
-        _ = tokio::time::sleep(Duration::from_secs(15)) => {
-            tracing::warn!("drain timed out after 15s; exiting anyway");
-        }
-    }
+    // The HTTP server has stopped accepting. Drain the forward worker so an in-flight agent delivery
+    // isn't dropped at shutdown; anything still only-pending stays on disk for the next startup drain.
+    tracing::info!("draining forward worker");
+    worker.shutdown(Duration::from_secs(15)).await;
     Ok(())
 }
 

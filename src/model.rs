@@ -17,7 +17,7 @@
 //! payload-shape drift on a GOWA bump degrades to a dropped message rather than a 500. Golden
 //! fixtures in `tests/fixtures` pin the exact shapes we expect.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// The GOWA webhook envelope.
 #[derive(Debug, Deserialize)]
@@ -59,7 +59,10 @@ pub enum DropReason {
 /// The shim's internal representation of an inbound message. Carries more than the forwarded
 /// contract: `sender` (DM allowlisting), `mentioned` (reply-to-bot), and `reply_to` never leave
 /// the shim — only `{chat_id, body, id, from_me}` is forwarded to the agent.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Serialize`/`Deserialize` are derived so the durable forward queue (`crate::forward`) can
+/// persist a pending message to disk and reload it verbatim after an agent outage or shim restart.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Inbound {
     /// Conversation JID — echoed back on `/send` so DM/group replies route correctly.
     pub chat_id: String,

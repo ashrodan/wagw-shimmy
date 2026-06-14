@@ -2,8 +2,9 @@
 //! `POST /whatsapp/inbound` with the bearer the agent expects. The forwarded body is the *original
 //! contract only* — `{chat_id, body, id, from_me}` — not the shim's richer internal model.
 //!
-//! This call happens in a spawned task **after** the webhook has already been acked 200 (see
-//! `server.rs`), so its `Result` is logged, not propagated: GOWA must not see the agent's latency.
+//! This call is driven by the durable forward worker (`crate::forward`) **after** the webhook has
+//! already been acked 200 (see `server.rs`). Its `Result` drives the worker's retry/dead-letter
+//! decision rather than being propagated to GOWA, which must not see the agent's latency.
 
 use reqwest::Client;
 use serde::Serialize;

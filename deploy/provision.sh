@@ -20,6 +20,9 @@ log() { printf '\n[provision:%s] %s\n' "$TENANT" "$*"; }
 log "ensuring service user + data dirs"
 id wagw >/dev/null 2>&1 || sudo useradd --system --create-home --home-dir /var/lib/wagw --shell /usr/sbin/nologin wagw
 sudo install -d -o wagw -g wagw -m 0750 /var/lib/wagw /var/lib/wagw/gowa /var/lib/wagw/shim /var/lib/wagw/agent
+# Durable forward queue (the shim also self-creates these at boot, but pre-make them so the dirs
+# exist with the right owner before the unit starts).
+sudo install -d -o wagw -g wagw -m 0750 /var/lib/wagw/shim/queue /var/lib/wagw/shim/queue/pending /var/lib/wagw/shim/queue/dead
 
 # 1. Join the tailnet early (so the operator can reach the box even if later steps wobble).
 log "joining tailnet"

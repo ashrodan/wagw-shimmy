@@ -7,6 +7,7 @@
 
 use std::{
     net::SocketAddr,
+    path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -29,6 +30,7 @@ use wagw_shimmy::{
     AppState, build_router,
     config::{Config, DmPolicy, GroupPolicy, PolicyConfig},
     gowa::sign,
+    model::Inbound,
 };
 
 const WEBHOOK_SECRET: &str = "tenant-webhook-secret";
@@ -42,6 +44,9 @@ struct Recorder {
     count: Arc<AtomicUsize>,
     /// Optional artificial delay before the mock responds (simulates a slow agent turn).
     delay: Arc<Mutex<Duration>>,
+    /// Number of requests the mock agent should reject with 500 before it starts succeeding
+    /// (simulates a flaky/recovering agent). Decrements per failed request.
+    fail_remaining: Arc<AtomicUsize>,
 }
 
 impl Recorder {
@@ -74,6 +79,11 @@ async fn spawn_mock_agent() -> (String, Recorder) {
                         == Some(&format!("Bearer {WEBHOOK_BEARER}"));
                     if !ok {
                         return StatusCode::UNAUTHORIZED;
+                    }
+                    // Simulate a flaky agent: reject the first `fail_remaining` requests with 500.
+                    if rec.fail_remaining.load(Ordering::SeqCst) > 0 {
+                        rec.fail_remaining.fetch_sub(1, Ordering::SeqCst);
+                        return StatusCode::INTERNAL_SERVER_ERROR;
                     }
                     rec.record(body).await;
                     StatusCode::OK
@@ -112,6 +122,14 @@ async fn serve(app: Router) -> SocketAddr {
     addr
 }
 
+/// A unique, never-cleaned queue dir per call (the OS reaps `/tmp`). Avoids a tempfile dependency
+/// and keeps concurrent tests from sharing a queue.
+fn unique_queue_dir() -> PathBuf {
+    static N: AtomicUsize = AtomicUsize::new(0);
+    let n = N.fetch_add(1, Ordering::SeqCst);
+    std::env::temp_dir().join(format!("wagw-e2e-{}-{}", std::process::id(), n))
+}
+
 fn test_config(gowa_url: &str, agent_base: &str) -> Config {
     Config {
         bind: "127.0.0.1:0".parse().unwrap(),
@@ -131,11 +149,29 @@ fn test_config(gowa_url: &str, agent_base: &str) -> Config {
             free_response_chats: vec![],
         },
         send_rate_per_min: 1000,
+        queue_dir: unique_queue_dir(),
+        // Few retries + a tiny backoff so dead-letter/retry tests finish in milliseconds.
+        forward_max_retries: 3,
+        forward_concurrency: 4,
+        forward_backoff: Duration::from_millis(10),
     }
 }
 
 async fn state_for(gowa_url: &str, agent_base: &str) -> AppState {
     AppState::new(Arc::new(test_config(gowa_url, agent_base))).unwrap()
+}
+
+/// Build an `Inbound` for tests that drive the forward queue directly.
+fn test_inbound(chat_id: &str, body: &str, id: &str) -> Inbound {
+    Inbound {
+        chat_id: chat_id.into(),
+        sender: chat_id.into(),
+        body: body.into(),
+        id: id.into(),
+        is_from_me: false,
+        mentioned: false,
+        reply_to: None,
+    }
 }
 
 /// POST a signed GOWA webhook through the shim router; returns the HTTP status.
@@ -173,7 +209,9 @@ async fn wait_for_hits(rec: &Recorder, want: usize) {
 async fn inbound_dm_is_forwarded_with_contract_body() {
     let (agent_url, agent) = spawn_mock_agent().await;
     let (gowa_url, _gowa) = spawn_mock_gowa("OUT_1").await;
-    let router = build_router(state_for(&gowa_url, &agent_url).await);
+    let state = state_for(&gowa_url, &agent_url).await;
+    let _worker = state.spawn_forward_worker();
+    let router = build_router(state);
 
     assert_eq!(
         post_webhook(&router, &fixture("dm_text.json")).await,
@@ -223,7 +261,9 @@ async fn inbound_bad_signature_is_rejected_and_not_forwarded() {
 async fn duplicate_delivery_forwards_once() {
     let (agent_url, agent) = spawn_mock_agent().await;
     let (gowa_url, _gowa) = spawn_mock_gowa("OUT_1").await;
-    let router = build_router(state_for(&gowa_url, &agent_url).await);
+    let state = state_for(&gowa_url, &agent_url).await;
+    let _worker = state.spawn_forward_worker();
+    let router = build_router(state);
 
     let raw = fixture("dm_text.json");
     assert_eq!(post_webhook(&router, &raw).await, StatusCode::OK);
@@ -269,7 +309,9 @@ async fn ack_is_fast_even_when_agent_is_slow() {
     let (gowa_url, _gowa) = spawn_mock_gowa("OUT_1").await;
     // Agent takes 2s to "process" — the webhook ack must not wait for it.
     *agent.delay.lock().await = Duration::from_secs(2);
-    let router = build_router(state_for(&gowa_url, &agent_url).await);
+    let state = state_for(&gowa_url, &agent_url).await;
+    let _worker = state.spawn_forward_worker();
+    let router = build_router(state);
 
     let started = std::time::Instant::now();
     assert_eq!(
@@ -288,6 +330,7 @@ async fn reply_to_bot_summons_in_require_mention_group() {
     let (agent_url, agent) = spawn_mock_agent().await;
     let (gowa_url, gowa) = spawn_mock_gowa("OUT_BOT_1").await;
     let state = state_for(&gowa_url, &agent_url).await;
+    let _worker = state.spawn_forward_worker();
     let router = build_router(state);
 
     // 1. Bot sends a message into the group; GOWA returns id OUT_BOT_1, which the shim records.
@@ -374,4 +417,97 @@ async fn healthz_ok() {
         .unwrap();
     let resp = router.oneshot(request).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn forward_retries_then_succeeds_and_clears_pending() {
+    let (agent_url, agent) = spawn_mock_agent().await;
+    let (gowa_url, _gowa) = spawn_mock_gowa("OUT_1").await;
+    // Agent rejects the first two forward attempts with 500, then accepts.
+    agent.fail_remaining.store(2, Ordering::SeqCst);
+    let state = state_for(&gowa_url, &agent_url).await;
+    let queue = state.queue.clone();
+    let _worker = state.spawn_forward_worker();
+    let router = build_router(state);
+
+    // Ack is still fast (it doesn't wait on the agent).
+    let started = std::time::Instant::now();
+    assert_eq!(
+        post_webhook(&router, &fixture("dm_text.json")).await,
+        StatusCode::OK
+    );
+    assert!(started.elapsed() < Duration::from_millis(500));
+
+    // The worker retries past the two 500s; the agent ultimately sees exactly one delivery.
+    wait_for_hits(&agent, 1).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(agent.hits(), 1, "the id is delivered exactly once");
+    assert_eq!(
+        queue.pending_len(),
+        0,
+        "the pending file is removed on success"
+    );
+    assert_eq!(
+        queue.dead_len(),
+        0,
+        "a recovered forward never dead-letters"
+    );
+}
+
+#[tokio::test]
+async fn forward_dead_letters_when_agent_stays_down() {
+    let (gowa_url, _gowa) = spawn_mock_gowa("OUT_1").await;
+    // Point the agent at a closed port so every forward attempt is refused.
+    let state = state_for(&gowa_url, "http://127.0.0.1:1").await;
+    let queue = state.queue.clone();
+    let _worker = state.spawn_forward_worker();
+    let router = build_router(state);
+
+    assert_eq!(
+        post_webhook(&router, &fixture("dm_text.json")).await,
+        StatusCode::OK
+    );
+
+    // After bounded retries the message lands in dead/ rather than being silently lost.
+    for _ in 0..100 {
+        if queue.dead_len() >= 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(queue.dead_len(), 1, "exhausted forward is dead-lettered");
+    assert_eq!(
+        queue.pending_len(),
+        0,
+        "the pending file is moved, not duplicated"
+    );
+}
+
+#[tokio::test]
+async fn startup_drain_processes_a_preseeded_pending_file() {
+    let (agent_url, agent) = spawn_mock_agent().await;
+    let (gowa_url, _gowa) = spawn_mock_gowa("OUT_1").await;
+    let state = state_for(&gowa_url, &agent_url).await;
+    let queue = state.queue.clone();
+
+    // Pre-seed a pending message BEFORE the worker exists — a stand-in for a file left by a crash.
+    queue
+        .enqueue(&test_inbound(
+            "61400111222@s.whatsapp.net",
+            "left over",
+            "PRESEED_1",
+        ))
+        .unwrap();
+    assert_eq!(queue.pending_len(), 1);
+
+    // Starting the worker must drain it on startup.
+    let _worker = state.spawn_forward_worker();
+    wait_for_hits(&agent, 1).await;
+
+    let bodies = agent.bodies.lock().await;
+    assert_eq!(bodies.len(), 1);
+    assert_eq!(bodies[0]["id"], "PRESEED_1");
+    assert_eq!(bodies[0]["body"], "left over");
+    drop(bodies);
+    assert_eq!(queue.pending_len(), 0, "the drained file is removed");
 }

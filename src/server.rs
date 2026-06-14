@@ -1,8 +1,8 @@
 //! axum wiring: shared state, route table, and the two mapping handlers.
 //!
 //! Routes:
-//! - `POST /webhook/gowa` — inbound: HMAC-verify raw bytes → build model → dedup → policy →
-//!   **ack 200 immediately**, forward to the agent in a spawned (drained) task.
+//! - `POST /webhook/gowa` — inbound: HMAC-verify raw bytes → build model → dedup-check → policy →
+//!   **durably enqueue** → mark dedup → **ack 200**; a bounded worker forwards to the agent.
 //! - `POST /send`        — outbound: bearer-verify → rate-limit → GOWA `/send/message`, record
 //!   the returned id for reply-to-bot detection.
 //! - `GET /healthz`      — liveness.
@@ -19,13 +19,13 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::sync::Arc;
 use subtle::ConstantTimeEq;
-use tokio_util::task::TaskTracker;
 
 use crate::{
     agent::AgentClient,
     config::Config,
     dedup::TtlSet,
     error::{DynError, HttpError},
+    forward::{ForwardQueue, ForwardWorker, WorkerConfig},
     gowa::{GowaClient, verify_signature},
     model::GowaEnvelope,
     policy,
@@ -47,17 +47,18 @@ pub struct AppState {
     pub dedup: Arc<TtlSet>,
     pub sent_ids: Arc<SentIds>,
     pub limiter: Arc<SendLimiter>,
-    /// Tracks spawned inbound-forward tasks so SIGTERM can drain them before exit.
-    pub tasks: TaskTracker,
+    /// Durable inbound→agent forward queue; the worker (spawned via `spawn_forward_worker`) drains it.
+    pub queue: ForwardQueue,
 }
 
 impl AppState {
     /// Build the shared state from a validated config. Constructs the HTTP clients once (shared
-    /// connection pools) and the bounded caches.
+    /// connection pools), the bounded caches, and opens the durable forward queue on disk.
     pub fn new(config: Arc<Config>) -> Result<Self, DynError> {
         let gowa = GowaClient::new(&config)?;
         let agent = AgentClient::new(&config)?;
         let limiter = Arc::new(SendLimiter::per_minute(config.send_rate_per_min));
+        let queue = ForwardQueue::new(&config.queue_dir)?;
         Ok(Self {
             config,
             gowa,
@@ -65,8 +66,20 @@ impl AppState {
             dedup: Arc::new(TtlSet::new(DEDUP_TTL, DEDUP_CAPACITY)),
             sent_ids: Arc::new(SentIds::new()),
             limiter,
-            tasks: TaskTracker::new(),
+            queue,
         })
+    }
+
+    /// Spawn the durable-forward worker. It drains anything already in `pending/` on startup, then
+    /// forwards each enqueued inbound to the agent with bounded retries. Returns the handle so the
+    /// caller can `shutdown()` it on SIGTERM; tests may drop it (the worker keeps running).
+    pub fn spawn_forward_worker(&self) -> ForwardWorker {
+        let worker_config = WorkerConfig::from_parts(
+            self.config.forward_concurrency,
+            self.config.forward_max_retries,
+            self.config.forward_backoff,
+        );
+        ForwardWorker::spawn(self.queue.clone(), self.agent.clone(), worker_config)
     }
 }
 
@@ -127,8 +140,10 @@ async fn webhook_gowa(State(state): State<AppState>, headers: HeaderMap, body: B
     // 4. Mention = reply-to-bot: did this message quote one of our own recently-sent ids?
     inbound.mentioned = state.sent_ids.is_reply_to_bot(inbound.reply_to.as_deref());
 
-    // 5. Dedup on id — GOWA re-delivers; forward each id at most once per window.
-    if !state.dedup.insert_new(&inbound.id) {
+    // 5. Fast-drop obvious GOWA re-deliveries before doing any work. This is a *check*, not a mark —
+    //    the authoritative mark happens after enqueue (step 8). A duplicate that races past this
+    //    check still lands on the same id-keyed queue file, so enqueue stays idempotent.
+    if state.dedup.contains(&inbound.id) {
         tracing::info!(id = %inbound.id, "dropped duplicate GOWA delivery");
         return StatusCode::OK.into_response();
     }
@@ -140,15 +155,18 @@ async fn webhook_gowa(State(state): State<AppState>, headers: HeaderMap, body: B
         return StatusCode::OK.into_response();
     }
 
-    // 7. Ack now; forward asynchronously so the agent's LLM latency can't trip GOWA's 10s timeout.
-    let agent = state.agent.clone();
-    state.tasks.spawn(async move {
-        if let Err(error) = agent.forward(&inbound).await {
-            tracing::warn!(id = %inbound.id, %error, "failed to forward inbound to agent");
-        } else {
-            tracing::info!(id = %inbound.id, chat = %inbound.chat_id, "forwarded inbound to agent");
-        }
-    });
+    // 7. Durably enqueue *before* acking. The worker forwards asynchronously, so the agent's LLM
+    //    latency can't trip GOWA's 10s timeout — but unlike a fire-and-forget task, a failed forward
+    //    survives agent downtime and shim restarts instead of being silently lost. If the enqueue
+    //    itself fails (e.g. disk full) we do NOT ack, so GOWA retries.
+    if let Err(error) = state.queue.enqueue(&inbound) {
+        tracing::error!(id = %inbound.id, %error, "failed to enqueue inbound; not acking so GOWA retries");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+
+    // 8. Mark the id seen (authoritative dedup) now that it is durably queued, then ack.
+    state.dedup.insert_new(&inbound.id);
+    tracing::info!(id = %inbound.id, chat = %inbound.chat_id, "enqueued inbound for forward");
 
     StatusCode::OK.into_response()
 }
