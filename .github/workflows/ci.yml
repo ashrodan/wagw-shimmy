@@ -14,7 +14,7 @@ jobs:
     name: shim — build, clippy, test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
@@ -27,19 +27,20 @@ jobs:
     name: gowa — build pinned binary artifact
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           submodules: recursive          # pulls vendor/gowa @ the pinned tag
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version: "1.23"              # pinned toolchain → reproducible artifact
+          cache-dependency-path: vendor/gowa/src/go.sum   # module lives in the submodule, not root
       # Build the pinned GOWA source ONCE here; fleet boxes install this binary (no Go on prod).
       - name: build gowa
         working-directory: vendor/gowa/src
         run: |
           CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" \
             -o "${GITHUB_WORKSPACE}/gowa-${GOWA_TAG}-linux-amd64" .
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: gowa-${{ env.GOWA_TAG }}-linux-amd64
           path: gowa-${{ env.GOWA_TAG }}-linux-amd64

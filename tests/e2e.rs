@@ -343,6 +343,27 @@ async fn send_requires_bearer() {
 }
 
 #[tokio::test]
+async fn oversized_body_is_rejected() {
+    let (agent_url, agent) = spawn_mock_agent().await;
+    let (gowa_url, _gowa) = spawn_mock_gowa("OUT_1").await;
+    let router = build_router(state_for(&gowa_url, &agent_url).await);
+
+    // 1 MiB body — above the 256 KiB cap. Must be rejected (413) and never forwarded.
+    let huge = "x".repeat(1024 * 1024);
+    let signature = sign(WEBHOOK_SECRET.as_bytes(), huge.as_bytes());
+    let request = Request::builder()
+        .method("POST")
+        .uri("/webhook/gowa")
+        .header("x-hub-signature-256", signature)
+        .body(Body::from(huge))
+        .unwrap();
+    let status = router.clone().oneshot(request).await.unwrap().status();
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(agent.hits(), 0);
+}
+
+#[tokio::test]
 async fn healthz_ok() {
     let (agent_url, _a) = spawn_mock_agent().await;
     let (gowa_url, _g) = spawn_mock_gowa("OUT_1").await;

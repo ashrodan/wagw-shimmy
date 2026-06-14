@@ -119,7 +119,7 @@ The agent's `WHATSAPP_GATEWAY_URL` points at the shim (`http://127.0.0.1:8080`).
 
 ```sh
 cargo build
-cargo test                  # 25 unit + 9 e2e; no network, no WA account, no API spend
+cargo test                  # 27 unit + 10 e2e; no network, no WA account, no API spend
 cargo clippy --all-targets  # CI-equivalent gate — keep clean
 ```
 

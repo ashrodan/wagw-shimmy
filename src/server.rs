@@ -10,7 +10,7 @@
 use axum::{
     Json, Router,
     body::Bytes,
-    extract::State,
+    extract::{DefaultBodyLimit, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -18,6 +18,7 @@ use axum::{
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::sync::Arc;
+use subtle::ConstantTimeEq;
 use tokio_util::task::TaskTracker;
 
 use crate::{
@@ -69,12 +70,18 @@ impl AppState {
     }
 }
 
+/// Upper bound on a request body. Inbound webhooks carry a single message (text/caption); outbound
+/// sends carry one text. 256 KiB is far above any legitimate body and caps memory a localhost
+/// peer (a compromised GOWA, or anything that reached loopback) could force us to buffer.
+const MAX_BODY_BYTES: usize = 256 * 1024;
+
 /// Assemble the router. Exposed so integration tests can drive it without binding a socket.
 pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/webhook/gowa", post(webhook_gowa))
         .route("/send", post(send))
+        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state)
 }
 
@@ -231,5 +238,38 @@ fn bearer_matches(headers: &HeaderMap, expected: &str) -> bool {
         .get("authorization")
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
-        .is_some_and(|token| token == expected)
+        .is_some_and(|token| constant_time_eq(token.as_bytes(), expected.as_bytes()))
+}
+
+/// Constant-time byte-string equality, so a token check doesn't leak how many leading bytes matched
+/// via timing. Length is compared first (a non-secret); equal-length contents go through `subtle`.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.ct_eq(b).into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn constant_time_eq_matches_only_identical_bytes() {
+        assert!(constant_time_eq(b"s3cr3t-token", b"s3cr3t-token"));
+        assert!(!constant_time_eq(b"s3cr3t-token", b"s3cr3t-toke")); // length differs
+        assert!(!constant_time_eq(b"s3cr3t-token", b"S3cr3t-token")); // one byte differs
+        assert!(constant_time_eq(b"", b""));
+    }
+
+    #[test]
+    fn bearer_matches_requires_exact_token() {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer right".parse().unwrap());
+        assert!(bearer_matches(&headers, "right"));
+        assert!(!bearer_matches(&headers, "wrong"));
+
+        let mut no_prefix = HeaderMap::new();
+        no_prefix.insert("authorization", "right".parse().unwrap()); // missing "Bearer "
+        assert!(!bearer_matches(&no_prefix, "right"));
+
+        assert!(!bearer_matches(&HeaderMap::new(), "right")); // no header
+    }
 }

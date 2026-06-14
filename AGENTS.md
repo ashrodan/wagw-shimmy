@@ -14,13 +14,20 @@ schema, HMAC scheme, and DM/group sequence diagrams, and `deploy/README.md` for 
 
 ```sh
 cargo build
-cargo test                          # 25 unit + 9 e2e — no network, no WA account, no API spend
+cargo test                          # 27 unit + 10 e2e — no network, no WA account, no API spend
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all --check
 ```
 
 Always run clippy + test before considering a change done. Tests must never require a real WhatsApp
 account or external network: the e2e suite stands up in-process mock GOWA + agent servers.
+
+## Docs
+
+- [`docs/TESTING.md`](docs/TESTING.md) — the three-tier testing checklist (automated / local E2E / acceptance) and the release ritual.
+- [`docs/HARDENING.md`](docs/HARDENING.md) — prioritised backlog (P0/P1/P2) of reliability + security work beyond the shipped shim.
+- [`docs/PAIRING.md`](docs/PAIRING.md) — the WhatsApp auth/pairing flow (`fleetctl pair`, QR, recovery).
+- [`docs/DECOMMISSION-BAE.md`](docs/DECOMMISSION-BAE.md) — Part C runbook (WhatsApp leaves Hermes).
 
 ## The one invariant
 
