@@ -126,6 +126,7 @@ cmd_add() {
     OPENAI_BEARER_TOKEN="$(secret_get "$id/openai_bearer_token")" \
     TAILSCALE_AUTHKEY="$(secret_get "$id/tailscale_authkey")" \
     GOWA_BINARY_URL="${GOWA_BINARY_URL:?set GOWA_BINARY_URL to the CI GOWA artifact}" \
+    GOWA_BINARY_SHA256="${GOWA_BINARY_SHA256:?set GOWA_BINARY_SHA256 to the published .sha256 of the artifact}" \
     "bash wagw-shimmy/deploy/provision.sh $id"
 
   cat <<EOF

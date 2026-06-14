@@ -15,6 +15,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/.." && pwd)"
 
 log() { printf '\n[provision:%s] %s\n' "$TENANT" "$*"; }
+die() { printf '\n[provision:%s] ERROR: %s\n' "$TENANT" "$*" >&2; exit 1; }
 
 # 0. Service user + per-tenant data dirs (idempotent).
 log "ensuring service user + data dirs"
@@ -40,10 +41,18 @@ fi
 export PATH="$HOME/.cargo/bin:$PATH"
 
 # 3. Install the PREBUILT GOWA binary (no Go toolchain on the box).
+#    Integrity is verified against GOWA_BINARY_SHA256 (the CI gowa-artifact job publishes a matching
+#    .sha256; the official GOWA release path also ships a checksums.txt — what the live wagw-1 install
+#    used). A mismatch aborts before install: a wrong/compromised/tag-drifted artifact never lands.
 log "installing prebuilt GOWA binary"
 : "${GOWA_BINARY_URL:?GOWA_BINARY_URL must point at the CI-built, pinned (v8.7.0) GOWA artifact}"
+: "${GOWA_BINARY_SHA256:?GOWA_BINARY_SHA256 must be the expected sha256 of the GOWA artifact}"
 tmp="$(mktemp)"
 curl -fsSL "$GOWA_BINARY_URL" -o "$tmp"
+if ! printf '%s  %s\n' "$GOWA_BINARY_SHA256" "$tmp" | sha256sum -c - >/dev/null 2>&1; then
+  rm -f "$tmp"
+  die "GOWA binary checksum mismatch — refusing to install (expected $GOWA_BINARY_SHA256)"
+fi
 sudo install -m 0755 "$tmp" /usr/local/bin/gowa
 rm -f "$tmp"
 

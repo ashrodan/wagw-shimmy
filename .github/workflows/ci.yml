@@ -43,8 +43,14 @@ jobs:
         run: |
           CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" \
             -o "${GITHUB_WORKSPACE}/gowa-${GOWA_TAG}-linux-amd64" .
+      # Publish a checksum alongside the binary so provision.sh can verify artifact integrity
+      # (guards against artifact mixups, compromised storage, or tag drift — not just transport).
+      - name: checksum gowa
+        run: sha256sum "gowa-${GOWA_TAG}-linux-amd64" > "gowa-${GOWA_TAG}-linux-amd64.sha256"
       - uses: actions/upload-artifact@v7
         with:
           name: gowa-${{ env.GOWA_TAG }}-linux-amd64
-          path: gowa-${{ env.GOWA_TAG }}-linux-amd64
+          path: |
+            gowa-${{ env.GOWA_TAG }}-linux-amd64
+            gowa-${{ env.GOWA_TAG }}-linux-amd64.sha256
           if-no-files-found: error
