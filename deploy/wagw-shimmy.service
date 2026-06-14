@@ -13,6 +13,17 @@ Type=simple
 User=wagw
 Group=wagw
 EnvironmentFile=/etc/wagw-shimmy.env
+# Secrets load from 0600 credential files (rendered by render-env.sh), NOT EnvironmentFile, so they
+# never land in the process environment (/proc/<pid>/environ). systemd exposes each at
+# $CREDENTIALS_DIRECTORY/<cred> (=%d/<cred>); the shim reads <NAME>_FILE and falls back to it.
+LoadCredential=gowa_basic_auth:/etc/wagw-shimmy.creds/gowa_basic_auth
+LoadCredential=gowa_webhook_secret:/etc/wagw-shimmy.creds/gowa_webhook_secret
+LoadCredential=whatsapp_webhook_token:/etc/wagw-shimmy.creds/whatsapp_webhook_token
+LoadCredential=whatsapp_gateway_token:/etc/wagw-shimmy.creds/whatsapp_gateway_token
+Environment=GOWA_BASIC_AUTH_FILE=%d/gowa_basic_auth
+Environment=GOWA_WEBHOOK_SECRET_FILE=%d/gowa_webhook_secret
+Environment=WHATSAPP_WEBHOOK_TOKEN_FILE=%d/whatsapp_webhook_token
+Environment=WHATSAPP_GATEWAY_TOKEN_FILE=%d/whatsapp_gateway_token
 WorkingDirectory=/var/lib/wagw/shim
 ExecStart=/usr/local/bin/wagw-shimmy
 

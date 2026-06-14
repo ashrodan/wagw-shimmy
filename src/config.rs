@@ -114,12 +114,12 @@ impl Config {
             .to_string();
         validate_url("GOWA_URL", &gowa_url)?;
 
-        let gowa_basic_auth = optional("GOWA_BASIC_AUTH")
+        let gowa_basic_auth = secret("GOWA_BASIC_AUTH")
             .map(|raw| BasicAuth::parse(&raw))
             .transpose()?;
 
         let gowa_device_id = required("GOWA_DEVICE_ID")?;
-        let gowa_webhook_secret = required("GOWA_WEBHOOK_SECRET")?;
+        let gowa_webhook_secret = required_secret("GOWA_WEBHOOK_SECRET")?;
         if gowa_webhook_secret == "secret" {
             return Err(boxed(
                 "GOWA_WEBHOOK_SECRET is still GOWA's default 'secret' — set a per-tenant secret",
@@ -133,8 +133,8 @@ impl Config {
         validate_url("AGENT_INBOUND_URL", &agent_inbound_url)?;
         let agent_health_url = format!("{agent_base}/health");
 
-        let whatsapp_webhook_token = required("WHATSAPP_WEBHOOK_TOKEN")?;
-        let whatsapp_gateway_token = required("WHATSAPP_GATEWAY_TOKEN")?;
+        let whatsapp_webhook_token = required_secret("WHATSAPP_WEBHOOK_TOKEN")?;
+        let whatsapp_gateway_token = required_secret("WHATSAPP_GATEWAY_TOKEN")?;
 
         let send_rate_per_min = match optional("WA_SEND_RATE_PER_MIN") {
             Some(raw) => raw
@@ -272,6 +272,32 @@ fn required(name: &str) -> Result<String, DynError> {
     optional(name).ok_or_else(|| boxed(format!("{name} is required but not set")))
 }
 
+/// Resolve a secret, preferring the direct env var, falling back to the file named by `<name>_FILE`.
+/// This is the systemd-credential route (`LoadCredential=` + `<name>_FILE=%d/<cred>`): the value
+/// lives in a 0600 file rather than the process environment (`/proc/<pid>/environ`). Direct env wins
+/// so manual/foreground runs and ad-hoc overrides keep working.
+fn secret(name: &str) -> Option<String> {
+    secret_from(optional(name), optional(&format!("{name}_FILE")))
+}
+
+/// Pure core of [`secret`]: direct value wins; otherwise read + trim the file at `file_path`. Kept
+/// separate from env access so it is unit-testable without mutating the process environment.
+fn secret_from(direct: Option<String>, file_path: Option<String>) -> Option<String> {
+    if let Some(value) = direct {
+        return Some(value);
+    }
+    let path = file_path?;
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|contents| contents.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// Like [`secret`] but required: errors naming the variable (and its `_FILE` form) — never the value.
+fn required_secret(name: &str) -> Result<String, DynError> {
+    secret(name).ok_or_else(|| boxed(format!("{name} is required (set {name} or {name}_FILE)")))
+}
+
 fn env_or(name: &str, default: &str) -> String {
     optional(name).unwrap_or_else(|| default.to_string())
 }
@@ -347,5 +373,52 @@ mod tests {
     #[test]
     fn basic_auth_rejects_missing_colon() {
         assert!(BasicAuth::parse("adminpass").is_err());
+    }
+
+    #[test]
+    fn secret_prefers_direct_value_over_file() {
+        let file = std::env::temp_dir().join(format!("wagw-secret-{}.txt", std::process::id()));
+        std::fs::write(&file, "from-file").unwrap();
+        // Direct env value wins even when a file is also present.
+        let resolved = secret_from(
+            Some("from-env".to_string()),
+            Some(file.to_string_lossy().into_owned()),
+        );
+        assert_eq!(resolved.as_deref(), Some("from-env"));
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
+    fn secret_reads_and_trims_file_when_direct_absent() {
+        let file =
+            std::env::temp_dir().join(format!("wagw-secret-file-{}.txt", std::process::id()));
+        // A trailing newline (as a credential file or `echo >` would leave) must be trimmed off.
+        std::fs::write(&file, "  s3cr3t-token\n").unwrap();
+        let resolved = secret_from(None, Some(file.to_string_lossy().into_owned()));
+        assert_eq!(resolved.as_deref(), Some("s3cr3t-token"));
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
+    fn secret_is_none_when_neither_present_or_file_empty() {
+        assert_eq!(secret_from(None, None), None);
+        let file =
+            std::env::temp_dir().join(format!("wagw-secret-empty-{}.txt", std::process::id()));
+        std::fs::write(&file, "   \n").unwrap(); // whitespace-only → treated as absent
+        assert_eq!(
+            secret_from(None, Some(file.to_string_lossy().into_owned())),
+            None
+        );
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
+    fn required_secret_error_names_the_variable_not_the_value() {
+        // A definitely-unset var: only reads env, never mutates it. Message must name the var.
+        let error = required_secret("WAGW_TEST_DEFINITELY_UNSET_SECRET")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("WAGW_TEST_DEFINITELY_UNSET_SECRET"));
+        assert!(error.contains("WAGW_TEST_DEFINITELY_UNSET_SECRET_FILE"));
     }
 }
