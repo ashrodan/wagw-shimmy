@@ -28,6 +28,17 @@ struct InboundForward<'a> {
     channel: &'a str,
 }
 
+/// What [`AgentClient::forward`] actually did, so the worker logs the truth. In debug-sink mode the
+/// forward is accepted-and-discarded (never POSTed), but still returns `Ok` so the durable queue
+/// drains — distinguishing the two prevents the "forwarded inbound to agent" log line from lying.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForwardOutcome {
+    /// POSTed to the agent and got a 2xx.
+    Forwarded,
+    /// Debug-sink mode: logged and discarded, no agent POST.
+    SinkDropped,
+}
+
 /// Cloneable client over the agent's inbound endpoint.
 #[derive(Clone)]
 pub struct AgentClient {
@@ -94,7 +105,7 @@ impl AgentClient {
     /// Forward an inbound message to the agent. Returns `Ok(())` on a 2xx; otherwise a descriptive
     /// error the caller logs. The shim never retries here — GOWA's own retry plus inbound dedup is
     /// the delivery-guarantee layer.
-    pub async fn forward(&self, inbound: &Inbound) -> Result<(), DynError> {
+    pub async fn forward(&self, inbound: &Inbound) -> Result<ForwardOutcome, DynError> {
         // Debug sink: no agent target. Log the exact contract that *would* be forwarded and report
         // success so the durable queue drains cleanly (nothing dead-letters). Validates the
         // GOWA⟷shim leg in isolation. `body` is message content, not a secret.
@@ -107,7 +118,7 @@ impl AgentClient {
                 body = %inbound.body,
                 "DEBUG SINK: accepted inbound (no agent target) — would forward this contract"
             );
-            return Ok(());
+            return Ok(ForwardOutcome::SinkDropped);
         }
 
         let body = InboundForward {
@@ -133,7 +144,7 @@ impl AgentClient {
 
         let status = response.status();
         if status.is_success() {
-            Ok(())
+            Ok(ForwardOutcome::Forwarded)
         } else {
             let snippet = response.text().await.unwrap_or_default();
             let snippet = snippet.chars().take(300).collect::<String>();

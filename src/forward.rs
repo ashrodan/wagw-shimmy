@@ -36,7 +36,7 @@ use tokio::{
 };
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
-use crate::{channel::ChannelRouter, error::DynError, model::Inbound};
+use crate::{agent::ForwardOutcome, channel::ChannelRouter, error::DynError, model::Inbound};
 
 /// A durable, id-keyed queue of inbound messages awaiting forward to the agent. Cheap to clone
 /// (paths plus an `Arc<Notify>`); the same handle lives in `AppState` and in the worker.
@@ -274,9 +274,16 @@ async fn process_file(
     let mut attempt: u32 = 0;
     loop {
         match agent.forward(&inbound).await {
-            Ok(()) => {
+            Ok(outcome) => {
                 let _ = fs::remove_file(path);
-                tracing::info!(id = %inbound.id, chat = %inbound.chat_id, channel = %inbound.channel, "forwarded inbound to agent");
+                match outcome {
+                    ForwardOutcome::Forwarded => {
+                        tracing::info!(id = %inbound.id, chat = %inbound.chat_id, channel = %inbound.channel, "forwarded inbound to agent")
+                    }
+                    ForwardOutcome::SinkDropped => {
+                        tracing::info!(id = %inbound.id, chat = %inbound.chat_id, channel = %inbound.channel, "debug-sink: inbound accepted and discarded (NOT forwarded)")
+                    }
+                }
                 return;
             }
             Err(error) if attempt >= config.max_retries => {
