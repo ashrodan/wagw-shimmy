@@ -39,7 +39,9 @@ async fn run() -> Result<(), DynError> {
     let app = build_router(state);
     let listener = TcpListener::bind(bind).await?;
     tracing::info!(%bind, "wagw-shimmy listening");
-    tracing::info!("routes: POST /webhook/gowa, POST /send, GET /livez, GET /readyz, GET /healthz");
+    tracing::info!(
+        "routes: POST /webhook/gowa, POST /send, POST /send/chat-presence, GET /livez, GET /readyz, GET /healthz"
+    );
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())

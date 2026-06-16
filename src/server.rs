@@ -5,6 +5,9 @@
 //!   **durably enqueue** → mark dedup → **ack 200**; a bounded worker forwards to the agent.
 //! - `POST /send`        — outbound: bearer-verify → rate-limit → GOWA `/send/message`, record
 //!   the returned id for reply-to-bot detection.
+//! - `POST /send/chat-presence` — typing indicator: bearer-verify → GOWA `/send/chat-presence`.
+//!   Deliberately *not* rate-limited (it is not a message send, so it must not spend the
+//!   `WA_SEND_RATE_PER_MIN` budget) and best-effort from the agent's side.
 //! - `GET /livez`        — process liveness (static); `/healthz` is an alias.
 //! - `GET /readyz`       — dependency-aware readiness (probes GOWA, optionally the agent).
 
@@ -99,6 +102,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/readyz", get(readyz))
         .route("/webhook/gowa", post(webhook_gowa))
         .route("/send", post(send))
+        .route("/send/chat-presence", post(send_chat_presence))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state)
 }
@@ -279,6 +283,58 @@ async fn send(
     Ok(Json(json!({ "sent": true, "id": message_id })))
 }
 
+/// The agent's typing indicator. `{phone|chat_id, action}` → GOWA `/send/chat-presence`. Same bearer
+/// as `/send`, but **not** rate-limited: a presence ping is not a message and must never consume the
+/// `WA_SEND_RATE_PER_MIN` budget (the agent refreshes it every ~10s during a turn). `action` is
+/// forwarded verbatim (`"start"`/`"stop"`); GOWA owns the enum.
+async fn send_chat_presence(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<Value>, HttpError> {
+    // 1. Same bearer the agent presents on `/send`.
+    if !bearer_matches(&headers, &state.config.whatsapp_gateway_token) {
+        return Err(HttpError::Unauthorized);
+    }
+
+    // 2. Parse after auth so unauthenticated callers learn nothing about the body shape.
+    let request: PresenceRequest = serde_json::from_slice(&body)
+        .map_err(|error| HttpError::BadRequest(format!("invalid presence body: {error}")))?;
+    let phone = request
+        .destination()
+        .ok_or_else(|| HttpError::BadRequest("missing 'phone'/'chat_id'".into()))?;
+    let action = request
+        .action
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| HttpError::BadRequest("missing 'action'".into()))?;
+
+    // 3. No rate-limit gate here (see the doc comment): presence is not a send.
+    state.gowa.send_presence(phone, action).await?;
+
+    Ok(Json(json!({ "presence": true })))
+}
+
+/// The agent's chat-presence body. It sends `chat_id` *and* `phone` (same value), mirroring the
+/// belt-and-braces keys of the send body, plus `action`. We coalesce the destination the same way.
+#[derive(Deserialize)]
+struct PresenceRequest {
+    #[serde(default)]
+    phone: Option<String>,
+    #[serde(default)]
+    chat_id: Option<String>,
+    #[serde(default)]
+    action: Option<String>,
+}
+
+impl PresenceRequest {
+    /// Destination JID — `phone` wins, then `chat_id`; trimmed, empty treated as absent.
+    fn destination(&self) -> Option<&str> {
+        first_non_empty([self.phone.as_deref(), self.chat_id.as_deref()])
+    }
+}
+
 /// The agent's send body. It sends `to` *and* `chat_id` (same value) plus `text` *and* `message`,
 /// so we accept them as distinct optional fields and coalesce — using serde `alias` would trip a
 /// duplicate-field error when both keys are present.
@@ -354,5 +410,23 @@ mod tests {
         assert!(!bearer_matches(&no_prefix, "right"));
 
         assert!(!bearer_matches(&HeaderMap::new(), "right")); // no header
+    }
+
+    #[test]
+    fn presence_destination_prefers_phone_then_chat_id() {
+        let both: PresenceRequest = serde_json::from_str(
+            r#"{"phone":"p@s.whatsapp.net","chat_id":"c@g.us","action":"start"}"#,
+        )
+        .unwrap();
+        assert_eq!(both.destination(), Some("p@s.whatsapp.net"));
+
+        // chat_id alone is honoured; whitespace-only phone is treated as absent.
+        let chat_only: PresenceRequest =
+            serde_json::from_str(r#"{"phone":"  ","chat_id":"c@g.us","action":"stop"}"#).unwrap();
+        assert_eq!(chat_only.destination(), Some("c@g.us"));
+
+        // Neither present → no destination.
+        let none: PresenceRequest = serde_json::from_str(r#"{"action":"start"}"#).unwrap();
+        assert_eq!(none.destination(), None);
     }
 }

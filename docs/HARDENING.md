@@ -43,7 +43,7 @@ Status: `[x]` done · `[ ]` open. Each item names the *why*, not just the *what*
 - [ ] **Persist dedup + sent-id caches.** Both are in-memory: a shim restart loses the dedup window (a GOWA re-delivery just after restart could double-fire) and the sent-id cache (reply-to-bot detection blind until the bot next sends). Persist to a small sled/SQLite if either becomes a real problem.
 - [ ] **True @-mention.** "Mention" is reply-to-bot by design (no GOWA patch). If a literal `@mention` summon becomes a hard need, carry a thin `vendor/gowa` patch surfacing `contextInfo.mentionedJid` and extend `model.rs`/`policy.rs`. Tracked as a deferred decision.
 - [ ] **Media mapping (P1.5).** Inbound media → `media_urls`; outbound `/send/image|file|video|audio|sticker`. Coordinated agent-contract extension. See TESTING.md §4.
-- [ ] **Outbound presence / receipts.** Typing indicators + read receipts passthrough for a more natural UX.
+- [ ] **Outbound presence / receipts.** Typing indicators shipped: `POST /send/chat-presence` forwards `{phone, action}` to GOWA (bearer-gated, off the send budget; see `AGENT-WHATSAPP-CONTRACT.md`). Read-receipt passthrough still outstanding.
 - [ ] **`tgw-shimmy` sibling.** Telegram off Hermes behind the same shim contract — explicitly out of scope now, parked here.
 - [ ] **wa-rs swap readiness.** When `whatsapp-rust` reaches whatsmeow parity, a pure-Rust gateway could replace GOWA behind the same shim contract; keep the GOWA client boundary clean so the swap is local to `gowa.rs`.
 

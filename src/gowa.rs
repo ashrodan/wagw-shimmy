@@ -7,6 +7,9 @@
 //! - **Outbound send:** `POST {gowa}/send/message {phone, message, reply_message_id}` with
 //!   `X-Device-Id` + HTTP basic auth, over a single shared `reqwest::Client`. GOWA 4xx maps to
 //!   `BadRequest` (the agent shouldn't retry), 5xx/timeout/connection to `Upstream` (retryable).
+//! - **Chat presence:** `POST {gowa}/send/chat-presence {phone, action}` (typing indicator), same
+//!   `X-Device-Id` + basic auth. Best-effort: the agent fires it fire-and-forget and never blocks the
+//!   turn on it, but the shim still surfaces a non-2xx so the caller can log.
 
 use hmac::{Hmac, Mac};
 use reqwest::{Client, StatusCode};
@@ -58,6 +61,7 @@ pub fn sign(secret: &[u8], body: &[u8]) -> String {
 pub struct GowaClient {
     http: Client,
     send_url: String,
+    presence_url: String,
     devices_url: String,
     device_id: String,
     basic_auth: Option<BasicAuth>,
@@ -76,6 +80,7 @@ impl GowaClient {
         Ok(Self {
             http,
             send_url: format!("{}/send/message", config.gowa_url),
+            presence_url: format!("{}/send/chat-presence", config.gowa_url),
             devices_url: format!("{}/devices", config.gowa_url),
             device_id: config.gowa_device_id.clone(),
             basic_auth: config.gowa_basic_auth.clone(),
@@ -141,6 +146,47 @@ impl GowaClient {
             )))
         }
     }
+
+    /// Set a chat presence (`action` is `"start"`/`"stop"` — typing indicator) for `phone` (the
+    /// conversation JID). Forwards verbatim to GOWA's `/send/chat-presence` with the same device id +
+    /// basic auth as `send_message`. Returns `()` on 2xx; error classification mirrors `send_message`
+    /// (4xx ⇒ `BadRequest`, 5xx/429/transport ⇒ `Upstream`). GOWA only renders the indicator when the
+    /// device presence is `available`; a non-2xx is the caller's to log, not to retry on.
+    pub async fn send_presence(&self, phone: &str, action: &str) -> Result<(), HttpError> {
+        let body = SendPresenceRequest { phone, action };
+
+        let mut request = self
+            .http
+            .post(&self.presence_url)
+            .header("X-Device-Id", &self.device_id)
+            .json(&body);
+        if let Some(auth) = &self.basic_auth {
+            request = request.basic_auth(&auth.user, Some(&auth.pass));
+        }
+
+        let response = request.send().await.map_err(|error| {
+            HttpError::Upstream(format!(
+                "GOWA presence request failed: {}",
+                classify(&error)
+            ))
+        })?;
+
+        let status = response.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        let raw = response.text().await.unwrap_or_default();
+        let snippet = raw.chars().take(300).collect::<String>();
+        if status.is_client_error() && status != StatusCode::TOO_MANY_REQUESTS {
+            Err(HttpError::BadRequest(format!(
+                "GOWA rejected presence ({status}): {snippet}"
+            )))
+        } else {
+            Err(HttpError::Upstream(format!(
+                "GOWA presence failed ({status}): {snippet}"
+            )))
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -149,6 +195,12 @@ struct SendMessageRequest<'a> {
     message: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     reply_message_id: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+struct SendPresenceRequest<'a> {
+    phone: &'a str,
+    action: &'a str,
 }
 
 /// Pull the assigned message id out of a GOWA send response. GOWA wraps results as

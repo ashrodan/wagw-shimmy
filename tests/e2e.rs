@@ -131,6 +131,49 @@ async fn spawn_mock_gowa(message_id: &'static str) -> (String, Recorder) {
     (format!("http://{addr}"), recorder)
 }
 
+/// Spawn a mock GOWA that also records `POST /send/chat-presence` on a *separate* recorder, so a
+/// presence ping can be distinguished from a message send (the rate-limit test relies on this).
+/// Returns `(url, send_recorder, presence_recorder)`.
+async fn spawn_mock_gowa_with_presence(message_id: &'static str) -> (String, Recorder, Recorder) {
+    let send_rec = Recorder::default();
+    let presence_rec = Recorder::default();
+    let app = Router::new()
+        .route(
+            "/send/message",
+            post({
+                let rec = send_rec.clone();
+                move |Json(body): Json<Value>| {
+                    let rec = rec.clone();
+                    async move {
+                        rec.record(body).await;
+                        Json(json!({ "code": "SUCCESS", "results": { "message_id": message_id } }))
+                    }
+                }
+            }),
+        )
+        .route(
+            "/send/chat-presence",
+            post({
+                let rec = presence_rec.clone();
+                move |Json(body): Json<Value>| {
+                    let rec = rec.clone();
+                    async move {
+                        rec.record(body).await;
+                        Json(json!({ "code": "SUCCESS", "results": { "status": "ok" } }))
+                    }
+                }
+            }),
+        )
+        .route(
+            "/devices",
+            axum::routing::get(|| async {
+                Json(json!({ "results": [{ "jid": "61400000000:1@s.whatsapp.net" }] }))
+            }),
+        );
+    let addr = serve(app).await;
+    (format!("http://{addr}"), send_rec, presence_rec)
+}
+
 async fn serve(app: Router) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -463,6 +506,106 @@ async fn send_requires_bearer() {
     let status = router.clone().oneshot(send).await.unwrap().status();
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert_eq!(gowa.hits(), 0, "unauthenticated send must not reach GOWA");
+}
+
+#[tokio::test]
+async fn chat_presence_is_forwarded_to_gowa_with_bearer() {
+    let (agent_url, _agent) = spawn_mock_agent().await;
+    let (gowa_url, _send, presence) = spawn_mock_gowa_with_presence("OUT_1").await;
+    let router = build_router(state_for(&gowa_url, &agent_url).await);
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/send/chat-presence")
+        .header("authorization", format!("Bearer {GATEWAY_BEARER}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({
+                "chat_id": "120363000000000000@g.us",
+                "phone": "120363000000000000@g.us",
+                "action": "start",
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let status = router.clone().oneshot(request).await.unwrap().status();
+    assert_eq!(status, StatusCode::OK);
+
+    wait_for_hits(&presence, 1).await;
+    let bodies = presence.bodies.lock().await;
+    assert_eq!(bodies.len(), 1);
+    // `phone` wins as the destination and `action` is forwarded verbatim.
+    assert_eq!(bodies[0]["phone"], "120363000000000000@g.us");
+    assert_eq!(bodies[0]["action"], "start");
+}
+
+#[tokio::test]
+async fn chat_presence_requires_bearer() {
+    let (agent_url, _agent) = spawn_mock_agent().await;
+    let (gowa_url, _send, presence) = spawn_mock_gowa_with_presence("OUT_1").await;
+    let router = build_router(state_for(&gowa_url, &agent_url).await);
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/send/chat-presence")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({"phone":"x@s.whatsapp.net","action":"start"}).to_string(),
+        ))
+        .unwrap();
+    let status = router.clone().oneshot(request).await.unwrap().status();
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        presence.hits(),
+        0,
+        "unauthenticated presence must not reach GOWA"
+    );
+}
+
+#[tokio::test]
+async fn chat_presence_does_not_consume_send_budget() {
+    // A presence ping must not spend the outbound send rate budget: with the budget set to 1/min,
+    // many presences must still leave a real send free.
+    let (agent_url, _agent) = spawn_mock_agent().await;
+    let (gowa_url, send, presence) = spawn_mock_gowa_with_presence("OUT_1").await;
+    let mut config = test_config(&gowa_url, &agent_url);
+    config.send_rate_per_min = 1;
+    let router = build_router(AppState::new(Arc::new(config)).unwrap());
+
+    // Fire several presence pings — none should touch the send limiter.
+    for _ in 0..5 {
+        let presence_req = Request::builder()
+            .method("POST")
+            .uri("/send/chat-presence")
+            .header("authorization", format!("Bearer {GATEWAY_BEARER}"))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({"phone":"x@s.whatsapp.net","action":"start"}).to_string(),
+            ))
+            .unwrap();
+        let status = router.clone().oneshot(presence_req).await.unwrap().status();
+        assert_eq!(status, StatusCode::OK);
+    }
+    wait_for_hits(&presence, 5).await;
+
+    // The single send budget is still intact.
+    let send_req = Request::builder()
+        .method("POST")
+        .uri("/send")
+        .header("authorization", format!("Bearer {GATEWAY_BEARER}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({"chat_id":"x@s.whatsapp.net","text":"hi"}).to_string(),
+        ))
+        .unwrap();
+    let status = router.clone().oneshot(send_req).await.unwrap().status();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "presence must not exhaust the send budget"
+    );
+    wait_for_hits(&send, 1).await;
+    assert_eq!(send.hits(), 1);
 }
 
 #[tokio::test]

@@ -66,6 +66,20 @@ endpoint and `spike-rust-agent.exe.xyz` 404 on `/whatsapp/inbound`.
   `to`/`text`; `429` rate-limited (`WA_SEND_RATE_PER_MIN`). The agent SHOULD treat `429`/`5xx` as
   retryable with backoff and SHOULD NOT spin.
 
+### Chat presence (typing indicator) — `POST {WHATSAPP_GATEWAY_URL}/send/chat-presence` (agent → shim)
+
+- **Auth:** same bearer as `/send` — `Authorization: Bearer <WHATSAPP_GATEWAY_TOKEN>`.
+- **Body:** `{ "chat_id": <JID>, "phone": <same JID>, "action": "start"|"stop" }`. The shim coalesces
+  `phone|chat_id` (phone wins) and forwards `{phone, action}` verbatim to GOWA's `/send/chat-presence`
+  with `X-Device-Id` + basic auth. `action` is passed through unmodified — GOWA owns the enum.
+- **Not rate-limited:** presence is *not* a message send and does **not** spend the
+  `WA_SEND_RATE_PER_MIN` budget. The agent SHOULD fire it best-effort/fire-and-forget (it refreshes
+  `start` roughly every 10 s during a turn, since WhatsApp's "composing" state auto-expires ~25 s) and
+  MUST NOT block the turn or the reply on it.
+- **Shim responses:** `200 {"presence":true}`; `401` bad bearer; `400` missing `phone`/`action`.
+  GOWA only *renders* the indicator when the device presence is `available`, so a `200` here does not
+  guarantee a visible "typing…".
+
 ### Health — `GET /health`
 
 - MUST return 2xx. The shim's `/readyz` optionally probes `{AGENT_INBOUND_URL base}/health` (sending
