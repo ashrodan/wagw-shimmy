@@ -14,6 +14,10 @@ device_jid: "61413118079@s.whatsapp.net"   # informational (the linked JID)
 # which is WRONG for this binary — must be fixed to use this value.
 gowa_device_id: "wagw-1"
 
+# Bot's own number (WA_SELF_NUMBER), digits only. Enables group @-mention detection: GOWA rewrites a
+# tag of the bot into the message body as "@61413118079", so an @-tag wakes the bot under require_mention.
+self_number: "61413118079"
+
 # Policy — current LIVE values on the box (set in-place; these include TEST settings).
 policy:
   dm_policy: allowlist            # open | allowlist | off
@@ -21,7 +25,8 @@ policy:
   group_policy: allowlist         # off | allowlist | open
   group_allow:
     - "120363428950046857@g.us"   # "Bae Bot Test group 1" (owner 61425700099)
-  require_mention: false          # TEST setting — revisit before live (true = reply-to-bot only)
+  require_mention: true           # DEFAULT now true: reply only when addressed (@-tag of self_number,
+                                  # or reply-to-bot). Set false only to make it answer every group message.
   free_response_chats: []
   send_rate_per_min: 20
 

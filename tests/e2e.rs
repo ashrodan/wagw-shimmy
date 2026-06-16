@@ -189,6 +189,7 @@ fn test_config(gowa_url: &str, agent_base: &str) -> Config {
         // Default-only routing (matches a config with no WA_CHANNELS): one channel = today's target.
         channels: vec![channel("default", agent_base, WEBHOOK_BEARER)],
         group_channels: vec![],
+        self_number: None,
     }
 }
 
@@ -339,6 +340,47 @@ async fn plain_group_message_dropped_under_require_mention() {
     );
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(agent.hits(), 0);
+}
+
+#[tokio::test]
+async fn at_mention_summons_in_require_mention_group() {
+    let (agent_url, agent) = spawn_mock_agent().await;
+    let (gowa_url, _gowa) = spawn_mock_gowa("OUT_1").await;
+
+    // The bot's own number; GOWA rewrites a tag of it into the body as `@61413118079`.
+    let mut config = test_config(&gowa_url, &agent_url);
+    config.self_number = Some("61413118079".into());
+    let state = AppState::new(Arc::new(config)).unwrap();
+    let _worker = state.spawn_forward_worker();
+    let router = build_router(state);
+
+    // A plain (untagged) group message is still dropped under require_mention=true.
+    assert_eq!(
+        post_webhook(&router, &fixture("group_text_plain.json")).await,
+        StatusCode::OK
+    );
+
+    // A group message that @-tags the bot is forwarded despite require_mention=true.
+    let tagged = json!({
+        "event": "message",
+        "device_id": "61400000000:1@s.whatsapp.net",
+        "payload": {
+            "chat_id": "120363000000000000@g.us",
+            "from": "61400111222@s.whatsapp.net",
+            "body": "@61413118079 what's the weather today?",
+            "id": "MSG_GROUP_TAG_1",
+            "is_from_me": false
+        }
+    })
+    .to_string();
+    assert_eq!(post_webhook(&router, &tagged).await, StatusCode::OK);
+
+    wait_for_hits(&agent, 1).await;
+    let bodies = agent.bodies.lock().await;
+    assert_eq!(bodies.len(), 1, "only the tagged message is forwarded");
+    // Answered IN THE GROUP, and it was the tagged message (not the plain one).
+    assert_eq!(bodies[0]["chat_id"], "120363000000000000@g.us");
+    assert_eq!(bodies[0]["id"], "MSG_GROUP_TAG_1");
 }
 
 #[tokio::test]

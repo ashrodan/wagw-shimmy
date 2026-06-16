@@ -176,8 +176,29 @@ async fn webhook_gowa(State(state): State<AppState>, headers: HeaderMap, body: B
         }
     };
 
-    // 4. Mention = reply-to-bot: did this message quote one of our own recently-sent ids?
-    inbound.mentioned = state.sent_ids.is_reply_to_bot(inbound.reply_to.as_deref());
+    // 4. Mention = the bot was addressed: either an `@`-tag of our own number (GOWA writes it into
+    //    the body as `@<self_number>`) OR this message quotes one of our own recently-sent ids
+    //    (reply-to-bot, i.e. continuing a thread we're in).
+    let tagged = state
+        .config
+        .self_number
+        .as_deref()
+        .is_some_and(|number| crate::model::body_mentions_number(&inbound.body, number));
+    inbound.mentioned = tagged || state.sent_ids.is_reply_to_bot(inbound.reply_to.as_deref());
+
+    // TEMP (remove after confirming the @-tag format on the live box): for group messages, log the
+    // raw body + mention verdict so we can verify GOWA rewrites a bot tag to `@<self_number>`.
+    if inbound.is_group() {
+        let preview: String = inbound.body.chars().take(160).collect();
+        tracing::info!(
+            id = %inbound.id,
+            chat = %inbound.chat_id,
+            mentioned = inbound.mentioned,
+            tagged,
+            body = %preview,
+            "TEMP group inbound (verifying @-tag format)"
+        );
+    }
 
     // 5. Fast-drop obvious GOWA re-deliveries before doing any work. This is a *check*, not a mark —
     //    the authoritative mark happens after enqueue (step 8). A duplicate that races past this

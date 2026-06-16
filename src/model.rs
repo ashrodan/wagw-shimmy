@@ -141,12 +141,51 @@ fn non_empty(value: Option<String>) -> Option<String> {
         .filter(|item| !item.is_empty())
 }
 
+/// True when `body` contains an `@`-mention of `number` (the bot's own number, digits only).
+///
+/// GOWA rewrites a WhatsApp tag into the message text as `@<phone-number>` (vendored
+/// `event_message.go::buildMessageBody`), so a group member tagging the bot shows up in `body` as
+/// `@<self_number>`. We require the matched number to be followed by a non-digit (or end of string)
+/// so `@614131180790` doesn't spuriously match self `@61413118079`. `number` empty ⇒ never matches.
+pub fn body_mentions_number(body: &str, number: &str) -> bool {
+    if number.is_empty() {
+        return false;
+    }
+    let needle = format!("@{number}");
+    let mut search_from = 0;
+    while let Some(offset) = body[search_from..].find(&needle) {
+        let end = search_from + offset + needle.len();
+        match body[end..].chars().next() {
+            // A trailing digit means we matched a prefix of a longer number — keep scanning.
+            Some(next) if next.is_ascii_digit() => search_from = end,
+            _ => return true,
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn parse(raw: &str) -> GowaEnvelope {
         serde_json::from_str(raw).unwrap()
+    }
+
+    #[test]
+    fn body_mention_detects_bot_tag() {
+        let n = "61413118079";
+        // GOWA-rewritten tag forms.
+        assert!(body_mentions_number("@61413118079 what's the weather", n));
+        assert!(body_mentions_number("hey @61413118079", n));
+        assert!(body_mentions_number("@61413118079", n));
+        // Not a mention of us.
+        assert!(!body_mentions_number("just chatting, no tag", n));
+        assert!(!body_mentions_number("@61400111222 hi", n));
+        // Boundary: a longer number that merely starts with ours must not match.
+        assert!(!body_mentions_number("@614131180790", n));
+        // Empty self-number never matches.
+        assert!(!body_mentions_number("@61413118079", ""));
     }
 
     #[test]

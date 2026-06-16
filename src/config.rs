@@ -69,6 +69,12 @@ pub struct Config {
     /// Group JID → channel label routing map (from `WA_GROUP_CHANNELS`). Validated at load: every
     /// label is configured and every JID is a group JID.
     pub group_channels: Vec<(String, String)>,
+    /// The bot's own WhatsApp number, digits only (e.g. `61413118079`), from `WA_SELF_NUMBER`.
+    /// Used to detect a group `@`-mention of the bot: GOWA rewrites a tag into the message body as
+    /// `@<number>` (see the vendored `event_message.go`), so a tag of the bot appears as
+    /// `@<self_number>`. `None` ⇒ `@`-mention detection is off (only reply-to-bot counts as a
+    /// mention).
+    pub self_number: Option<String>,
 }
 
 /// GOWA HTTP basic-auth pair, parsed from `user:pass`.
@@ -203,6 +209,11 @@ impl Config {
         let group_channels = parse_group_channels(&env_or("WA_GROUP_CHANNELS", ""))?;
         validate_group_channel_labels(&group_channels, &label_set)?;
 
+        // The bot's own number, for group `@`-mention detection (see `Config::self_number`).
+        let self_number = optional("WA_SELF_NUMBER")
+            .map(|raw| normalise_self_number(&raw))
+            .filter(|number| !number.is_empty());
+
         // Admission convenience: a group you've assigned a channel is implicitly allowlisted, so it
         // need not also be listed in `WA_GROUP_ALLOW`. Policy itself stays pure — `require_mention`
         // and `group_policy=off` still apply.
@@ -248,6 +259,7 @@ impl Config {
             forward_backoff,
             channels,
             group_channels,
+            self_number,
         })
     }
 }
@@ -381,7 +393,10 @@ impl PolicyConfig {
                 .collect(),
             group_policy,
             group_allow: list("WA_GROUP_ALLOW"),
-            require_mention: env_bool("WA_REQUIRE_MENTION"),
+            // Default ON: in a group the bot stays quiet unless addressed (an `@`-mention of its
+            // number, or a reply to one of its own messages). Set `WA_REQUIRE_MENTION=false` to make
+            // it answer every message in an allowlisted group.
+            require_mention: env_bool_default("WA_REQUIRE_MENTION", true),
             free_response_chats: list("WA_FREE_RESPONSE_CHATS"),
         })
     }
@@ -396,6 +411,15 @@ pub fn normalise_dm_jid(raw: &str) -> String {
     }
     let digits = trimmed.trim_start_matches('+');
     format!("{digits}{DM_SUFFIX}")
+}
+
+/// Normalise `WA_SELF_NUMBER` to bare digits. Accepts a bare number (`61413118079`), a `+`-prefixed
+/// number, or a full JID (`61413118079@s.whatsapp.net`) — keeps only the leading user part's digits
+/// so it can be matched against the `@<number>` form GOWA writes into a tagged message body.
+pub fn normalise_self_number(raw: &str) -> String {
+    let user = raw.trim().trim_start_matches('+');
+    let user = user.split('@').next().unwrap_or("");
+    user.chars().filter(char::is_ascii_digit).collect()
 }
 
 // --- small env helpers (mirror the agent's `non_empty` discipline) ---
@@ -447,6 +471,15 @@ fn env_or(name: &str, default: &str) -> String {
 
 fn env_bool(name: &str) -> bool {
     matches!(optional(name).as_deref(), Some("1" | "true" | "yes" | "on"))
+}
+
+/// Like [`env_bool`] but returns `default` when the var is unset/blank. A set-but-non-truthy value
+/// is `false` (matches `env_bool`'s leniency), so `WA_REQUIRE_MENTION=false|0|no|off` disables it.
+fn env_bool_default(name: &str, default: bool) -> bool {
+    match optional(name).as_deref() {
+        Some(value) => matches!(value, "1" | "true" | "yes" | "on"),
+        None => default,
+    }
 }
 
 /// Parse a comma-separated env var into a trimmed, non-empty list (order preserved).
