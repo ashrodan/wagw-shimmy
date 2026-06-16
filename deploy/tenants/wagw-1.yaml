@@ -1,0 +1,52 @@
+# wagw-1 — the FIRST real tenant, stood up BY HAND (see docs/FIRST-NUMBER.md), not via `fleetctl`.
+# This file is a record of the live config as of 2026-06-16. Several values differ from how the
+# fleet automation would render them, because the running GOWA is MULTI-DEVICE (see docs/PAIRING.md)
+# and `fleetctl pair`/`render_remote` don't yet handle that. Treat the TODOs below as real gaps.
+
+id: wagw-1
+box: wagw-1.exe.xyz
+magicdns: ""                      # TODO: set the tailnet MagicDNS name. Blank → fleetctl uses `box`.
+
+# WhatsApp device. PAIRED 2026-06-16; WA display name "Bae".
+device_jid: "61413118079@s.whatsapp.net"   # informational (the linked JID)
+# IMPORTANT (multi-device build): GOWA_DEVICE_ID is the CHOSEN device id, NOT the JID. The shim sends
+# it as X-Device-Id and GOWA resolves the device by it. fleetctl currently sets GOWA_DEVICE_ID=<jid>,
+# which is WRONG for this binary — must be fixed to use this value.
+gowa_device_id: "wagw-1"
+
+# Policy — current LIVE values on the box (set in-place; these include TEST settings).
+policy:
+  dm_policy: allowlist            # open | allowlist | off
+  dm_allow: []                    # empty → no DM sender admitted yet (add your own number to test DMs)
+  group_policy: allowlist         # off | allowlist | open
+  group_allow:
+    - "120363428950046857@g.us"   # "Bae Bot Test group 1" (owner 61425700099)
+  require_mention: false          # TEST setting — revisit before live (true = reply-to-bot only)
+  free_response_chats: []
+  send_rate_per_min: 20
+
+# Per-group channel routing (deploy/channels-env.awk): none configured → single "default" channel.
+# Note: wagw-1 still runs the OLD pre-channel-routing shim binary; redeploy before relying on this.
+# channels: []
+# group_channels: []
+
+# Downstream agent — NOT yet wired to a working spike-rust-agent.
+# AGENT_INBOUND_URL on the box currently points at the OLD Hermes agent
+# (https://wagw1-to-agent.int.exe.xyz: /health 200 but /whatsapp/inbound 404). spike-rust-agent.exe.xyz
+# also 404s on /whatsapp/inbound (WhatsApp channel not enabled). The shim is held in DEBUG SINK
+# (SHIM_DEBUG_SINK=true drop-in) until a real spike-rust-agent inbound endpoint exists.
+agent_inbound_url: "https://wagw1-to-agent.int.exe.xyz"   # TODO: repoint at a real spike-rust-agent
+debug_sink: true                                          # TODO: turn off before real traffic
+
+# Secret NAMES — wagw-1's secrets are currently INLINE on the box (manual setup), not in a store.
+# TODO: migrate to the store + LoadCredential on the next full provision.
+secrets:
+  gowa_basic_auth: wagw-1/gowa_basic_auth                 # TODO: confirm store names
+  gowa_webhook_secret: wagw-1/gowa_webhook_secret
+  whatsapp_webhook_token: wagw-1/whatsapp_webhook_token
+  whatsapp_gateway_token: wagw-1/whatsapp_gateway_token
+
+# Backups: pairing session lives in /var/lib/wagw/gowa/whatsapp.db (whatsmeow keys — SECRET, never in
+# git). On-box snapshot: /var/lib/wagw/gowa/whatsapp-firstpair-20260616-100411.db. Off-box copy taken
+# to the operator's ~/wagw-backups/ on 2026-06-16. deploy/backup.sh (restic→R2) not yet wired for this
+# tenant. TODO: durable scheduled off-box backup.
