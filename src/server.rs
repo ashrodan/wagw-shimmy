@@ -311,9 +311,16 @@ async fn send_chat_presence(
         .ok_or_else(|| HttpError::BadRequest("missing 'action'".into()))?;
 
     // 3. No rate-limit gate here (see the doc comment): presence is not a send.
-    state.gowa.send_presence(phone, action).await?;
-
-    Ok(Json(json!({ "presence": true })))
+    match state.gowa.send_presence(phone, action).await {
+        Ok(()) => {
+            tracing::info!(phone = %phone, action, "forwarded chat-presence to GOWA");
+            Ok(Json(json!({ "presence": true })))
+        }
+        Err(error) => {
+            tracing::warn!(phone = %phone, action, %error, "chat-presence forward to GOWA failed");
+            Err(error)
+        }
+    }
 }
 
 /// The agent's chat-presence body. It sends `chat_id` *and* `phone` (same value), mirroring the
