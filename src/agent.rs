@@ -106,6 +106,10 @@ impl AgentClient {
     /// error the caller logs. The shim never retries here — GOWA's own retry plus inbound dedup is
     /// the delivery-guarantee layer.
     pub async fn forward(&self, inbound: &Inbound) -> Result<ForwardOutcome, DynError> {
+        // The forwarded text is the composed agent body: when the message is a reply, the quoted
+        // text is prepended so the agent sees what the user was replying to, not just a bare @tag.
+        let agent_body = inbound.agent_body();
+
         // Debug sink: no agent target. Log the exact contract that *would* be forwarded and report
         // success so the durable queue drains cleanly (nothing dead-letters). Validates the
         // GOWA⟷shim leg in isolation. `body` is message content, not a secret.
@@ -115,7 +119,7 @@ impl AgentClient {
                 id = %inbound.id,
                 from_me = inbound.is_from_me,
                 channel = %inbound.channel,
-                body = %inbound.body,
+                body = %agent_body,
                 "DEBUG SINK: accepted inbound (no agent target) — would forward this contract"
             );
             return Ok(ForwardOutcome::SinkDropped);
@@ -123,7 +127,7 @@ impl AgentClient {
 
         let body = InboundForward {
             chat_id: &inbound.chat_id,
-            body: &inbound.body,
+            body: &agent_body,
             id: &inbound.id,
             from_me: inbound.is_from_me,
             channel: &inbound.channel,

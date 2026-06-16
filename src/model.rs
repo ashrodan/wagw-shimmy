@@ -43,6 +43,11 @@ pub struct GowaPayload {
     pub is_from_me: bool,
     #[serde(default)]
     pub replied_to_id: Option<String>,
+    /// Text of the message this one quotes (a reply), if any. GOWA sets it from the quoted
+    /// message's body (`event_message.go::buildMessageBody`). We prepend it to the forwarded body
+    /// so a "reply + @tag" carries the question being replied to, not just the bare mention.
+    #[serde(default)]
+    pub quoted_body: Option<String>,
 }
 
 /// Why an inbound message was not forwarded. Returned by [`GowaEnvelope::into_inbound`] for the
@@ -75,6 +80,11 @@ pub struct Inbound {
     pub mentioned: bool,
     /// The id of the quoted message, if any.
     pub reply_to: Option<String>,
+    /// Text of the quoted message, if this is a reply. Prepended to the forwarded body by
+    /// [`Inbound::agent_body`] so the agent sees the context the user replied to. `#[serde(default)]`
+    /// so a pending queue file written before this field existed still loads (as `None`).
+    #[serde(default)]
+    pub quoted_body: Option<String>,
     /// The downstream channel label this message routes to. Initialised to `"default"` here; the
     /// server overwrites it with the resolved label (see [`crate::channel::ChannelRouter`]) after
     /// policy passes, *before* the durable enqueue, so the routing decision survives the queue and a
@@ -93,6 +103,30 @@ impl Inbound {
     /// True when `chat_id` is a group JID (`…@g.us`).
     pub fn is_group(&self) -> bool {
         self.chat_id.ends_with(crate::config::GROUP_SUFFIX)
+    }
+
+    /// The message text presented to the agent. When this message quotes another (a reply), the
+    /// quoted text is prepended as a `>`-quote block so the agent has the context the user replied
+    /// to. Without this, a "reply + @tag" reaches the agent as a bare mention (e.g. `@61413118079`)
+    /// with no content — the user's actual question lives in the *quoted* message, which arrives (if
+    /// at all) as a separate, un-addressed message that policy drops. Falls back to the plain body
+    /// when nothing is quoted, so non-reply messages are unchanged.
+    pub fn agent_body(&self) -> String {
+        match self.quoted_body.as_deref().map(str::trim) {
+            Some(quoted) if !quoted.is_empty() => {
+                let quoted_block = quoted
+                    .lines()
+                    .map(|line| format!("> {line}"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if self.body.trim().is_empty() {
+                    quoted_block
+                } else {
+                    format!("{quoted_block}\n\n{}", self.body)
+                }
+            }
+            _ => self.body.clone(),
+        }
     }
 }
 
@@ -125,6 +159,7 @@ impl GowaEnvelope {
             is_from_me: false,
             mentioned: false,
             reply_to: non_empty(payload.replied_to_id),
+            quoted_body: non_empty(payload.quoted_body),
             channel: default_channel_label(),
         })
     }
@@ -202,6 +237,47 @@ mod tests {
         assert_eq!(inbound.id, "msg_1");
         assert_eq!(inbound.reply_to.as_deref(), Some("prev_9"));
         assert!(inbound.is_group());
+    }
+
+    #[test]
+    fn parses_quoted_body_and_composes_agent_body() {
+        // A reply-to + @tag: GOWA puts the typed mention in `body` and the replied-to message's
+        // text in `quoted_body`. The agent must see both, with the quote prepended.
+        let env = parse(
+            r#"{"event":"message","payload":{
+                "chat_id":"123-456@g.us","from":"61400111222@s.whatsapp.net",
+                "body":"@61413118079","id":"m1","replied_to_id":"q9",
+                "quoted_body":"did you know how to format tables in whatsapp?"}}"#,
+        );
+        let inbound = env.into_inbound().unwrap();
+        assert_eq!(
+            inbound.quoted_body.as_deref(),
+            Some("did you know how to format tables in whatsapp?")
+        );
+        assert_eq!(
+            inbound.agent_body(),
+            "> did you know how to format tables in whatsapp?\n\n@61413118079"
+        );
+    }
+
+    #[test]
+    fn agent_body_without_quote_is_plain_body() {
+        let env =
+            parse(r#"{"event":"message","payload":{"chat_id":"x@g.us","body":"hello","id":"m"}}"#);
+        let inbound = env.into_inbound().unwrap();
+        assert!(inbound.quoted_body.is_none());
+        assert_eq!(inbound.agent_body(), "hello");
+    }
+
+    #[test]
+    fn agent_body_quote_only_when_body_empty() {
+        // A reply with no added text (just quoting) → forward the quote alone, multi-line prefixed.
+        let mut inbound =
+            parse(r#"{"event":"message","payload":{"chat_id":"x@g.us","body":"","id":"m"}}"#)
+                .into_inbound()
+                .unwrap();
+        inbound.quoted_body = Some("line one\nline two".to_string());
+        assert_eq!(inbound.agent_body(), "> line one\n> line two");
     }
 
     #[test]

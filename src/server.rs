@@ -191,15 +191,25 @@ async fn webhook_gowa(State(state): State<AppState>, headers: HeaderMap, body: B
     inbound.mentioned = tagged || state.sent_ids.is_reply_to_bot(inbound.reply_to.as_deref());
 
     // TEMP (remove after confirming the @-tag format on the live box): for group messages, log the
-    // raw body + mention verdict so we can verify GOWA rewrites a bot tag to `@<self_number>`.
+    // raw body + mention verdict so we can verify GOWA rewrites a bot tag to `@<self_number>`, plus
+    // whether a quoted body came through (a reply carries the replied-to text in `quoted_body`).
     if inbound.is_group() {
         let preview: String = inbound.body.chars().take(160).collect();
+        let quoted_preview: String = inbound
+            .quoted_body
+            .as_deref()
+            .unwrap_or("")
+            .chars()
+            .take(160)
+            .collect();
         tracing::info!(
             id = %inbound.id,
             chat = %inbound.chat_id,
             mentioned = inbound.mentioned,
             tagged,
+            has_quote = inbound.quoted_body.is_some(),
             body = %preview,
+            quoted = %quoted_preview,
             "TEMP group inbound (verifying @-tag format)"
         );
     }

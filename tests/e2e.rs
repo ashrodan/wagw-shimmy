@@ -250,6 +250,7 @@ fn test_inbound(chat_id: &str, body: &str, id: &str) -> Inbound {
         is_from_me: false,
         mentioned: false,
         reply_to: None,
+        quoted_body: None,
         channel: "default".into(),
     }
 }
@@ -424,6 +425,47 @@ async fn at_mention_summons_in_require_mention_group() {
     // Answered IN THE GROUP, and it was the tagged message (not the plain one).
     assert_eq!(bodies[0]["chat_id"], "120363000000000000@g.us");
     assert_eq!(bodies[0]["id"], "MSG_GROUP_TAG_1");
+}
+
+#[tokio::test]
+async fn reply_with_tag_forwards_quoted_question_as_context() {
+    // The reported bug: replying to a message and @-tagging the bot forwarded only the bare
+    // mention (`@<self>`), so the agent had no question to answer. GOWA carries the replied-to
+    // text in `quoted_body`; the shim must prepend it so the agent sees the actual question.
+    let (agent_url, agent) = spawn_mock_agent().await;
+    let (gowa_url, _gowa) = spawn_mock_gowa("OUT_1").await;
+
+    let mut config = test_config(&gowa_url, &agent_url);
+    config.self_number = Some("61413118079".into());
+    let state = AppState::new(Arc::new(config)).unwrap();
+    let _worker = state.spawn_forward_worker();
+    let router = build_router(state);
+
+    let reply = json!({
+        "event": "message",
+        "device_id": "61400000000:1@s.whatsapp.net",
+        "payload": {
+            "chat_id": "120363000000000000@g.us",
+            "from": "61400111222@s.whatsapp.net",
+            "body": "@61413118079",
+            "id": "MSG_REPLY_TAG_1",
+            "is_from_me": false,
+            "replied_to_id": "MSG_QUOTED_9",
+            "quoted_body": "did you know how to format tables in whatsapp?"
+        }
+    })
+    .to_string();
+    assert_eq!(post_webhook(&router, &reply).await, StatusCode::OK);
+
+    wait_for_hits(&agent, 1).await;
+    let bodies = agent.bodies.lock().await;
+    assert_eq!(bodies.len(), 1);
+    assert_eq!(bodies[0]["id"], "MSG_REPLY_TAG_1");
+    // The forwarded body carries the quoted question, prepended as a `>`-quote, above the mention.
+    assert_eq!(
+        bodies[0]["body"],
+        "> did you know how to format tables in whatsapp?\n\n@61413118079"
+    );
 }
 
 #[tokio::test]
