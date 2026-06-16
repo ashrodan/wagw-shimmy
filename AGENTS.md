@@ -14,7 +14,7 @@ schema, HMAC scheme, and DM/group sequence diagrams, and `deploy/README.md` for 
 
 ```sh
 cargo build
-cargo test                          # 36 unit + 16 e2e — no network, no WA account, no API spend
+cargo test                          # 45 unit + 19 e2e — no network, no WA account, no API spend
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all --check
 ```
@@ -46,7 +46,8 @@ e2e test `reply_to_bot_summons_in_require_mention_group` guards it.
 - `error.rs` — `HttpError` (bad_request / unauthorized / rate_limited / upstream); never logs secrets.
 - `model.rs` — GOWA webhook wire types + the internal `Inbound`; structural drops.
 - `gowa.rs` — GOWA client (`/send/message`) + inbound HMAC verify over raw bytes.
-- `agent.rs` — agent client (`POST /whatsapp/inbound` + bearer); forwards the 4-field contract only.
+- `agent.rs` — agent client (`POST /whatsapp/inbound` + bearer); forwards `{chat_id,body,id,from_me,channel}`.
+- `channel.rs` — per-group channel routing: `ChannelRouter` (label→client + group→label) + the default channel.
 - `policy.rs` — **pure**, unit-tested admission policy (DM/group allowlist + require-mention).
 - `dedup.rs` — bounded-TTL `TtlSet` (drops GOWA re-deliveries).
 - `sent_ids.rs` — bounded-TTL cache of the bot's own sent ids → reply-to-bot mention detection.

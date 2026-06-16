@@ -26,6 +26,8 @@
 #   Policy values are passed via env too (provision.sh extracts them from the yaml):
 #     WA_DM_POLICY WA_DM_ALLOW WA_GROUP_POLICY WA_GROUP_ALLOW WA_REQUIRE_MENTION
 #     WA_FREE_RESPONSE_CHATS WA_SEND_RATE_PER_MIN GOWA_DEVICE_ID
+#   Optional per-group channel routing (empty → default-only):
+#     WA_CHANNELS  WA_CHANNEL_<L>_URL  WA_CHANNEL_<L>_TOKEN  WA_GROUP_CHANNELS
 set -euo pipefail
 
 TENANT="${1:?usage: render-env.sh <tenant-id>}"
@@ -64,6 +66,35 @@ write_secret gowa_webhook_secret    "${GOWA_WEBHOOK_SECRET}"
 write_secret whatsapp_webhook_token "${WHATSAPP_WEBHOOK_TOKEN}"
 write_secret whatsapp_gateway_token "${WHATSAPP_GATEWAY_TOKEN}"
 
+# --- per-group channel routing (optional) ---
+# Empty WA_CHANNELS → emit nothing → single "default" channel (current behaviour, e.g. wagw-1).
+# For each label L: WA_CHANNEL_<U>_URL is a non-secret base URL (kept in the env file); a non-empty
+# WA_CHANNEL_<U>_TOKEN is written to a 0600 credential file and referenced via WA_CHANNEL_<U>_TOKEN_FILE
+# (the shim's secret() reads it). NOTE: per-channel tokens are written here but, since channel labels
+# are dynamic, the static systemd unit does not yet LoadCredential them — wire a matching
+# LoadCredential when standing up distinct per-channel bearers (the multi-target operational step).
+# Channels whose agent shares the default inbound bearer need no token at all.
+CHANNEL_ENV=""
+if [ -n "${WA_CHANNELS:-}" ]; then
+  IFS=',' read -r -a _wa_labels <<< "${WA_CHANNELS}"
+  for _label in "${_wa_labels[@]}"; do
+    _label="$(printf '%s' "$_label" | tr -d '[:space:]')"
+    [ -n "$_label" ] || continue
+    _u="$(printf '%s' "$_label" | tr 'a-z' 'A-Z')"
+    _l="$(printf '%s' "$_label" | tr 'A-Z' 'a-z')"
+    _url_var="WA_CHANNEL_${_u}_URL"
+    _tok_var="WA_CHANNEL_${_u}_TOKEN"
+    _url="${!_url_var:-}"
+    [ -n "$_url" ] || { echo "render-env: $_url_var is required for channel '$_label'" >&2; exit 1; }
+    CHANNEL_ENV="${CHANNEL_ENV}WA_CHANNEL_${_u}_URL=${_url}"$'\n'
+    _tok="${!_tok_var:-}"
+    if [ -n "$_tok" ]; then
+      write_secret "wa_channel_${_l}_token" "$_tok"
+      CHANNEL_ENV="${CHANNEL_ENV}WA_CHANNEL_${_u}_TOKEN_FILE=${CRED_DIR}/wa_channel_${_l}_token"$'\n'
+    fi
+  done
+fi
+
 # --- shim env (NON-SECRET only; the four secrets above come from credential files) ---
 write "$ETC_DIR/wagw-shimmy.env" <<EOF
 # rendered by render-env.sh for tenant ${TENANT} — do not edit by hand
@@ -79,8 +110,15 @@ WA_GROUP_ALLOW=${WA_GROUP_ALLOW:-}
 WA_REQUIRE_MENTION=${WA_REQUIRE_MENTION:-true}
 WA_FREE_RESPONSE_CHATS=${WA_FREE_RESPONSE_CHATS:-}
 WA_SEND_RATE_PER_MIN=${WA_SEND_RATE_PER_MIN:-20}
+WA_CHANNELS=${WA_CHANNELS:-}
+WA_GROUP_CHANNELS=${WA_GROUP_CHANNELS:-}
 RUST_LOG=info
 EOF
+
+# Append per-channel URL / token-file lines (nothing when WA_CHANNELS is empty).
+if [ -n "$CHANNEL_ENV" ]; then
+  printf '%s' "$CHANNEL_ENV" >> "$ETC_DIR/wagw-shimmy.env"
+fi
 
 # --- agent env (secrets still inline; cross-repo *_FILE follow-on tracked in spike-rust-agent) ---
 write "$ETC_DIR/agent.env" <<EOF

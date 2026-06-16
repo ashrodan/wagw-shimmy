@@ -73,6 +73,9 @@ log "rendering /etc/*.env"
 y() { grep -E "^[[:space:]]*$1:" "$REPO/deploy/tenants/${TENANT}.yaml" | head -1 | sed -E "s/^[^:]*:[[:space:]]*//; s/[\"']//g"; }
 list() { sed -n "/^[[:space:]]*$1:/,/^[[:space:]]*[a-z_]*:/p" "$REPO/deploy/tenants/${TENANT}.yaml" \
            | grep -E '^[[:space:]]+-' | sed -E 's/^[[:space:]]+-[[:space:]]*//; s/[\"'\'']//g' | paste -sd, -; }
+# Optional per-group channel routing → WA_CHANNELS / WA_CHANNEL_<L>_URL / WA_GROUP_CHANNELS env lines
+# (empty when the yaml has no channels: block → default-only, unchanged).
+mapfile -t CHANNEL_ENV < <(awk -f "$HERE/channels-env.awk" "$REPO/deploy/tenants/${TENANT}.yaml")
 sudo env \
   GOWA_BASIC_AUTH="${GOWA_BASIC_AUTH:?}" \
   GOWA_WEBHOOK_SECRET="${GOWA_WEBHOOK_SECRET:?}" \
@@ -87,6 +90,7 @@ sudo env \
   WA_REQUIRE_MENTION="$(y require_mention)" \
   WA_FREE_RESPONSE_CHATS="$(list free_response_chats)" \
   WA_SEND_RATE_PER_MIN="$(y send_rate_per_min)" \
+  "${CHANNEL_ENV[@]}" \
   bash "$HERE/render-env.sh" "$TENANT"
 
 # 7. Install + enable the systemd units (ordering: gowa → shim → agent).

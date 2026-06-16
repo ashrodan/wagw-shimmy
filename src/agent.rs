@@ -1,6 +1,7 @@
 //! Agent downstream client. Forwards an inbound message to the Rust agent's
-//! `POST /whatsapp/inbound` with the bearer the agent expects. The forwarded body is the *original
-//! contract only* — `{chat_id, body, id, from_me}` — not the shim's richer internal model.
+//! `POST /whatsapp/inbound` with the bearer the agent expects. The forwarded body is the contract
+//! `{chat_id, body, id, from_me, channel}` — not the shim's richer internal model. `channel` is the
+//! resolved per-group routing label (see [`crate::channel`]); the agent ignores it today.
 //!
 //! This call is driven by the durable forward worker (`crate::forward`) **after** the webhook has
 //! already been acked 200 (see `server.rs`). Its `Result` drives the worker's retry/dead-letter
@@ -16,12 +17,15 @@ use std::time::Duration;
 use crate::{config::Config, error::DynError, model::Inbound};
 
 /// The exact JSON the agent's WhatsApp channel deserialises. Field names are fixed by that contract.
+/// `channel` is a new, additive field: the agent ignores unknown fields today (its request type is a
+/// plain `Deserialize` with no `deny_unknown_fields`), so it can persona-differentiate on it later.
 #[derive(Serialize)]
 struct InboundForward<'a> {
     chat_id: &'a str,
     body: &'a str,
     id: &'a str,
     from_me: bool,
+    channel: &'a str,
 }
 
 /// Cloneable client over the agent's inbound endpoint.
@@ -36,10 +40,17 @@ pub struct AgentClient {
 }
 
 impl AgentClient {
-    pub fn new(config: &Config) -> Result<Self, DynError> {
-        // A bounded timeout so a wedged agent doesn't pin a forward task forever. This is larger
-        // than GOWA's 10s webhook timeout deliberately — we've already acked GOWA, so the agent is
-        // free to take a full LLM turn; we just don't want an unbounded hang.
+    /// Build a client for one concrete endpoint (one channel target). The reqwest build is shared by
+    /// every channel, so [`crate::channel::ChannelRouter`] constructs one client per channel through
+    /// here. A bounded timeout so a wedged agent doesn't pin a forward task forever — larger than
+    /// GOWA's 10s webhook timeout deliberately: we've already acked GOWA, so the agent is free to
+    /// take a full LLM turn; we just don't want an unbounded hang.
+    pub fn with_endpoint(
+        inbound_url: String,
+        health_url: String,
+        bearer: String,
+        debug_sink: bool,
+    ) -> Result<Self, DynError> {
         let http = Client::builder()
             .timeout(Duration::from_secs(120))
             .build()
@@ -50,11 +61,22 @@ impl AgentClient {
             })?;
         Ok(Self {
             http,
-            inbound_url: config.agent_inbound_url.clone(),
-            health_url: config.agent_health_url.clone(),
-            bearer: config.whatsapp_webhook_token.clone(),
-            debug_sink: config.agent_debug_sink,
+            inbound_url,
+            health_url,
+            bearer,
+            debug_sink,
         })
+    }
+
+    /// Build the single-target client from config — equivalent to today's behaviour and to the
+    /// default channel. Thin wrapper over [`AgentClient::with_endpoint`].
+    pub fn new(config: &Config) -> Result<Self, DynError> {
+        Self::with_endpoint(
+            config.agent_inbound_url.clone(),
+            config.agent_health_url.clone(),
+            config.whatsapp_webhook_token.clone(),
+            config.agent_debug_sink,
+        )
     }
 
     /// Optional readiness probe: a short-timeout `GET /health` (the agent exposes `/health`, not
@@ -81,6 +103,7 @@ impl AgentClient {
                 chat_id = %inbound.chat_id,
                 id = %inbound.id,
                 from_me = inbound.is_from_me,
+                channel = %inbound.channel,
                 body = %inbound.body,
                 "DEBUG SINK: accepted inbound (no agent target) — would forward this contract"
             );
@@ -92,6 +115,7 @@ impl AgentClient {
             body: &inbound.body,
             id: &inbound.id,
             from_me: inbound.is_from_me,
+            channel: &inbound.channel,
         };
 
         let response = self

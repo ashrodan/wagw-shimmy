@@ -36,7 +36,7 @@ use tokio::{
 };
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
-use crate::{agent::AgentClient, error::DynError, model::Inbound};
+use crate::{channel::ChannelRouter, error::DynError, model::Inbound};
 
 /// A durable, id-keyed queue of inbound messages awaiting forward to the agent. Cheap to clone
 /// (paths plus an `Arc<Notify>`); the same handle lives in `AppState` and in the worker.
@@ -127,10 +127,11 @@ pub struct ForwardWorker {
 
 impl ForwardWorker {
     /// Spawn the worker loop. It drains `pending/` immediately (startup recovery), then loops on the
-    /// queue's `Notify` plus a periodic tick until cancelled.
-    pub fn spawn(queue: ForwardQueue, agent: AgentClient, config: WorkerConfig) -> Self {
+    /// queue's `Notify` plus a periodic tick until cancelled. The `router` routes each file to its
+    /// channel's client by the persisted `Inbound.channel` label.
+    pub fn spawn(queue: ForwardQueue, router: Arc<ChannelRouter>, config: WorkerConfig) -> Self {
         let cancel = CancellationToken::new();
-        let handle = tokio::spawn(worker_loop(queue, agent, config, cancel.clone()));
+        let handle = tokio::spawn(worker_loop(queue, router, config, cancel.clone()));
         Self { cancel, handle }
     }
 
@@ -148,7 +149,7 @@ impl ForwardWorker {
 /// Shared state the loop threads into each spawned forward task.
 struct Worker {
     queue: ForwardQueue,
-    agent: AgentClient,
+    router: Arc<ChannelRouter>,
     config: WorkerConfig,
     semaphore: Arc<Semaphore>,
     /// Filenames currently being processed, so a tick/notify mid-retry can't double-spawn the same
@@ -160,7 +161,7 @@ struct Worker {
 
 async fn worker_loop(
     queue: ForwardQueue,
-    agent: AgentClient,
+    router: Arc<ChannelRouter>,
     config: WorkerConfig,
     cancel: CancellationToken,
 ) {
@@ -169,7 +170,7 @@ async fn worker_loop(
         in_flight: Arc::new(Mutex::new(HashSet::new())),
         forwards: TaskTracker::new(),
         queue,
-        agent,
+        router,
         config,
         cancel: cancel.clone(),
     };
@@ -221,7 +222,7 @@ impl Worker {
             }
 
             let semaphore = self.semaphore.clone();
-            let agent = self.agent.clone();
+            let router = self.router.clone();
             let dead = self.queue.dead.clone();
             let config = self.config.clone();
             let cancel = self.cancel.clone();
@@ -231,7 +232,7 @@ impl Worker {
                     .acquire_owned()
                     .await
                     .expect("forward semaphore never closed");
-                process_file(&path, &agent, &dead, &config, &cancel).await;
+                process_file(&path, &router, &dead, &config, &cancel).await;
                 in_flight.lock().expect("in_flight poisoned").remove(&name);
             });
         }
@@ -243,7 +244,7 @@ impl Worker {
 /// in `pending/` for the next startup drain.
 async fn process_file(
     path: &Path,
-    agent: &AgentClient,
+    router: &ChannelRouter,
     dead: &Path,
     config: &WorkerConfig,
     cancel: &CancellationToken,
@@ -266,12 +267,16 @@ async fn process_file(
         }
     };
 
+    // Route by the persisted channel label. A label no longer configured falls back to the default
+    // client (with a warn) rather than dead-lettering — see `ChannelRouter::client_for`.
+    let agent = router.client_for(&inbound.channel);
+
     let mut attempt: u32 = 0;
     loop {
         match agent.forward(&inbound).await {
             Ok(()) => {
                 let _ = fs::remove_file(path);
-                tracing::info!(id = %inbound.id, chat = %inbound.chat_id, "forwarded inbound to agent");
+                tracing::info!(id = %inbound.id, chat = %inbound.chat_id, channel = %inbound.channel, "forwarded inbound to agent");
                 return;
             }
             Err(error) if attempt >= config.max_retries => {
@@ -345,6 +350,7 @@ mod tests {
             is_from_me: false,
             mentioned: false,
             reply_to: None,
+            channel: "default".into(),
         }
     }
 

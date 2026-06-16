@@ -21,6 +21,23 @@ policy:
   free_response_chats: []
   send_rate_per_min: 20
 
+# Per-group channel routing (OPTIONAL). Omit both sections → single "default" channel = today's
+# behaviour (unmapped groups + all DMs forward to the agent at AGENT_INBOUND_URL). A group listed in
+# group_channels is implicitly admitted, so it need not also appear in policy.group_allow.
+#
+# channels: extra downstream targets. label is [a-z0-9_] ("default" is reserved/implicit). url is a
+# base (/whatsapp/inbound is appended). token_secret is OPTIONAL — a secret NAME in the store; omit it
+# to reuse the default inbound bearer (whatsapp_webhook_token).
+# channels:
+#   - label: support
+#     url: http://127.0.0.1:3002
+#     token_secret: acme/support_webhook_token
+#   - label: ops
+#     url: http://127.0.0.1:3003
+# group_channels:
+#   - jid: "120363000000000000@g.us"
+#     channel: support
+
 # Secret NAMES in the store (values fetched at provision/render time).
 secrets:
   gowa_basic_auth: acme/gowa_basic_auth

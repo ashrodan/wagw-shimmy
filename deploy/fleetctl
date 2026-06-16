@@ -69,6 +69,10 @@ yaml_list() { sed -n "/^[[:space:]]*$2:/,/^[[:space:]]*[a-z_]*:/p" "$HERE/tenant
 #   render_remote <id> <gowa_device_id>
 render_remote() {
   local id="$1" device_id="$2" host; host="$(ssh_host "$id")"
+  # Optional per-group channel routing → WA_CHANNELS / WA_CHANNEL_<L>_URL / WA_GROUP_CHANNELS
+  # (empty when the tenant yaml has no channels: block → default-only, unchanged).
+  local channel_env=()
+  mapfile -t channel_env < <(awk -f "$HERE/channels-env.awk" "$HERE/tenants/$id.yaml")
   ssh "$host" \
     GOWA_BASIC_AUTH="$(secret_get "$id/gowa_basic_auth")" \
     GOWA_WEBHOOK_SECRET="$(secret_get "$id/gowa_webhook_secret")" \
@@ -83,6 +87,7 @@ render_remote() {
     WA_REQUIRE_MENTION="$(yaml_val "$id" require_mention)" \
     WA_FREE_RESPONSE_CHATS="$(yaml_list "$id" free_response_chats)" \
     WA_SEND_RATE_PER_MIN="$(yaml_val "$id" send_rate_per_min)" \
+    "${channel_env[@]}" \
     "cd wagw-shimmy && sudo -E bash deploy/render-env.sh $id && sudo systemctl restart gowa wagw-shimmy agent"
 }
 

@@ -22,7 +22,7 @@ use std::sync::Arc;
 use subtle::ConstantTimeEq;
 
 use crate::{
-    agent::AgentClient,
+    channel::ChannelRouter,
     config::Config,
     dedup::TtlSet,
     error::{DynError, HttpError},
@@ -44,7 +44,9 @@ const DEDUP_CAPACITY: usize = 50_000;
 pub struct AppState {
     pub config: Arc<Config>,
     pub gowa: GowaClient,
-    pub agent: AgentClient,
+    /// Per-group channel router (label → client + group→label map). Replaces the single agent
+    /// client: `webhook_gowa` resolves a label, the forward worker forwards to its client.
+    pub router: Arc<ChannelRouter>,
     pub dedup: Arc<TtlSet>,
     pub sent_ids: Arc<SentIds>,
     pub limiter: Arc<SendLimiter>,
@@ -57,13 +59,13 @@ impl AppState {
     /// connection pools), the bounded caches, and opens the durable forward queue on disk.
     pub fn new(config: Arc<Config>) -> Result<Self, DynError> {
         let gowa = GowaClient::new(&config)?;
-        let agent = AgentClient::new(&config)?;
+        let router = Arc::new(ChannelRouter::from_config(&config)?);
         let limiter = Arc::new(SendLimiter::per_minute(config.send_rate_per_min));
         let queue = ForwardQueue::new(&config.queue_dir)?;
         Ok(Self {
             config,
             gowa,
-            agent,
+            router,
             dedup: Arc::new(TtlSet::new(DEDUP_TTL, DEDUP_CAPACITY)),
             sent_ids: Arc::new(SentIds::new()),
             limiter,
@@ -80,7 +82,7 @@ impl AppState {
             self.config.forward_max_retries,
             self.config.forward_backoff,
         );
-        ForwardWorker::spawn(self.queue.clone(), self.agent.clone(), worker_config)
+        ForwardWorker::spawn(self.queue.clone(), self.router.clone(), worker_config)
     }
 }
 
@@ -117,7 +119,9 @@ async fn readyz(State(state): State<AppState>) -> Response {
         // can't mistake a sink-mode box for one wired to a real agent.
         (json!({ "debug_sink": true }), true)
     } else if state.config.readyz_probe_agent {
-        let ok = state.agent.ping().await;
+        // Probe the default channel's client — preserves today's single-target readiness. Per-channel
+        // probing is a noted future extension.
+        let ok = state.router.default_client().ping().await;
         (json!({ "ok": ok }), ok)
     } else {
         (json!({ "skipped": true }), true)
@@ -190,7 +194,12 @@ async fn webhook_gowa(State(state): State<AppState>, headers: HeaderMap, body: B
         return StatusCode::OK.into_response();
     }
 
-    // 7. Durably enqueue *before* acking. The worker forwards asynchronously, so the agent's LLM
+    // 7. Resolve the downstream channel and stamp it on the message *before* enqueue, so the routing
+    //    decision is persisted with the message and survives the durable queue and a shim restart.
+    //    A mapped group → its channel; every unmapped group and every DM → "default".
+    inbound.channel = state.router.channel_for(&inbound);
+
+    // 8. Durably enqueue *before* acking. The worker forwards asynchronously, so the agent's LLM
     //    latency can't trip GOWA's 10s timeout — but unlike a fire-and-forget task, a failed forward
     //    survives agent downtime and shim restarts instead of being silently lost. If the enqueue
     //    itself fails (e.g. disk full) we do NOT ack, so GOWA retries.
@@ -199,9 +208,9 @@ async fn webhook_gowa(State(state): State<AppState>, headers: HeaderMap, body: B
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 
-    // 8. Mark the id seen (authoritative dedup) now that it is durably queued, then ack.
+    // 9. Mark the id seen (authoritative dedup) now that it is durably queued, then ack.
     state.dedup.insert_new(&inbound.id);
-    tracing::info!(id = %inbound.id, chat = %inbound.chat_id, "enqueued inbound for forward");
+    tracing::info!(id = %inbound.id, chat = %inbound.chat_id, channel = %inbound.channel, "enqueued inbound for forward");
 
     StatusCode::OK.into_response()
 }

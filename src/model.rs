@@ -75,6 +75,18 @@ pub struct Inbound {
     pub mentioned: bool,
     /// The id of the quoted message, if any.
     pub reply_to: Option<String>,
+    /// The downstream channel label this message routes to. Initialised to `"default"` here; the
+    /// server overwrites it with the resolved label (see [`crate::channel::ChannelRouter`]) after
+    /// policy passes, *before* the durable enqueue, so the routing decision survives the queue and a
+    /// restart. `#[serde(default)]` so a pending file written before this field existed still loads
+    /// (it falls back to `"default"`, i.e. today's behaviour) instead of dead-lettering.
+    #[serde(default = "default_channel_label")]
+    pub channel: String,
+}
+
+/// The default value for [`Inbound::channel`]: the always-present default channel label.
+fn default_channel_label() -> String {
+    crate::channel::DEFAULT_CHANNEL.to_string()
 }
 
 impl Inbound {
@@ -113,6 +125,7 @@ impl GowaEnvelope {
             is_from_me: false,
             mentioned: false,
             reply_to: non_empty(payload.replied_to_id),
+            channel: default_channel_label(),
         })
     }
 }

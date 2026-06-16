@@ -102,6 +102,7 @@ mod tests {
             is_from_me: false,
             mentioned: false,
             reply_to: None,
+            channel: "default".into(),
         }
     }
 
@@ -114,6 +115,7 @@ mod tests {
             is_from_me: false,
             mentioned,
             reply_to: None,
+            channel: "default".into(),
         }
     }
 

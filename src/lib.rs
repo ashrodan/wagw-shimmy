@@ -16,6 +16,7 @@
 //! Modules are exposed for integration tests; the binary entry point is `src/main.rs`.
 
 pub mod agent;
+pub mod channel;
 pub mod config;
 pub mod dedup;
 pub mod error;

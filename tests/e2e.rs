@@ -28,6 +28,7 @@ use tower::ServiceExt;
 
 use wagw_shimmy::{
     AppState, build_router,
+    channel::ChannelConfig,
     config::{Config, DmPolicy, GroupPolicy, PolicyConfig},
     gowa::sign,
     model::Inbound,
@@ -36,6 +37,8 @@ use wagw_shimmy::{
 const WEBHOOK_SECRET: &str = "tenant-webhook-secret";
 const WEBHOOK_BEARER: &str = "agent-inbound-bearer";
 const GATEWAY_BEARER: &str = "agent-to-shim-bearer";
+/// A distinct bearer for the per-group channel `support`, to prove the right credential is sent.
+const CHANNEL_A_BEARER: &str = "channel-support-bearer";
 
 /// Captured requests a mock server has seen.
 #[derive(Clone, Default)]
@@ -64,33 +67,41 @@ impl Recorder {
     }
 }
 
-/// Spawn a mock agent (`POST /whatsapp/inbound`) on an ephemeral port. Records the forwarded body
-/// and asserts the bearer; returns its base URL and the recorder.
+/// Spawn a mock agent (`POST /whatsapp/inbound`) on an ephemeral port asserting the default bearer.
 async fn spawn_mock_agent() -> (String, Recorder) {
+    spawn_mock_agent_bearer(WEBHOOK_BEARER).await
+}
+
+/// Spawn a mock agent that asserts a specific bearer (so per-channel bearers can be distinguished).
+/// Records the forwarded body; returns its base URL and the recorder.
+async fn spawn_mock_agent_bearer(expected_bearer: &'static str) -> (String, Recorder) {
     let recorder = Recorder::default();
-    let app = Router::new()
-        .route(
-            "/whatsapp/inbound",
-            post(
-                |State(rec): State<Recorder>, headers: HeaderMap, Json(body): Json<Value>| async move {
-                    let ok = headers
-                        .get("authorization")
-                        .and_then(|value| value.to_str().ok())
-                        == Some(&format!("Bearer {WEBHOOK_BEARER}"));
-                    if !ok {
-                        return StatusCode::UNAUTHORIZED;
-                    }
-                    // Simulate a flaky agent: reject the first `fail_remaining` requests with 500.
-                    if rec.fail_remaining.load(Ordering::SeqCst) > 0 {
-                        rec.fail_remaining.fetch_sub(1, Ordering::SeqCst);
-                        return StatusCode::INTERNAL_SERVER_ERROR;
-                    }
-                    rec.record(body).await;
-                    StatusCode::OK
-                },
-            ),
-        )
-        .with_state(recorder.clone());
+    let app =
+        Router::new()
+            .route(
+                "/whatsapp/inbound",
+                post(
+                    move |State(rec): State<Recorder>,
+                          headers: HeaderMap,
+                          Json(body): Json<Value>| async move {
+                        let ok = headers
+                            .get("authorization")
+                            .and_then(|value| value.to_str().ok())
+                            == Some(&format!("Bearer {expected_bearer}"));
+                        if !ok {
+                            return StatusCode::UNAUTHORIZED;
+                        }
+                        // Simulate a flaky agent: reject the first `fail_remaining` requests with 500.
+                        if rec.fail_remaining.load(Ordering::SeqCst) > 0 {
+                            rec.fail_remaining.fetch_sub(1, Ordering::SeqCst);
+                            return StatusCode::INTERNAL_SERVER_ERROR;
+                        }
+                        rec.record(body).await;
+                        StatusCode::OK
+                    },
+                ),
+            )
+            .with_state(recorder.clone());
     let addr = serve(app).await;
     (format!("http://{addr}"), recorder)
 }
@@ -137,6 +148,17 @@ fn unique_queue_dir() -> PathBuf {
     std::env::temp_dir().join(format!("wagw-e2e-{}-{}", std::process::id(), n))
 }
 
+/// A `ChannelConfig` for a base URL with the given label + bearer (mirrors the renderer's URL shape).
+fn channel(label: &str, base: &str, bearer: &str) -> ChannelConfig {
+    let base = base.trim_end_matches('/');
+    ChannelConfig {
+        label: label.into(),
+        inbound_url: format!("{base}/whatsapp/inbound"),
+        health_url: format!("{base}/health"),
+        bearer: bearer.into(),
+    }
+}
+
 fn test_config(gowa_url: &str, agent_base: &str) -> Config {
     Config {
         bind: "127.0.0.1:0".parse().unwrap(),
@@ -164,6 +186,9 @@ fn test_config(gowa_url: &str, agent_base: &str) -> Config {
         forward_max_retries: 3,
         forward_concurrency: 4,
         forward_backoff: Duration::from_millis(10),
+        // Default-only routing (matches a config with no WA_CHANNELS): one channel = today's target.
+        channels: vec![channel("default", agent_base, WEBHOOK_BEARER)],
+        group_channels: vec![],
     }
 }
 
@@ -181,6 +206,7 @@ fn test_inbound(chat_id: &str, body: &str, id: &str) -> Inbound {
         is_from_me: false,
         mentioned: false,
         reply_to: None,
+        channel: "default".into(),
     }
 }
 
@@ -237,6 +263,8 @@ async fn inbound_dm_is_forwarded_with_contract_body() {
     assert_eq!(forwarded["body"], "hello from a dm");
     assert_eq!(forwarded["id"], "MSG_DM_1");
     assert_eq!(forwarded["from_me"], false);
+    // A DM always routes to the default channel; the label travels with the forward.
+    assert_eq!(forwarded["channel"], "default");
     assert!(
         forwarded.get("sender").is_none(),
         "internal-only fields must not leak"
@@ -576,6 +604,61 @@ async fn forward_dead_letters_when_agent_stays_down() {
         queue.pending_len(),
         0,
         "the pending file is moved, not duplicated"
+    );
+}
+
+#[tokio::test]
+async fn mapped_group_routes_to_its_channel_and_others_default() {
+    // Two downstream agents: a per-group channel `support` (its own bearer) and the default.
+    let (support_url, support) = spawn_mock_agent_bearer(CHANNEL_A_BEARER).await;
+    let (default_url, default_agent) = spawn_mock_agent().await;
+    let (gowa_url, _gowa) = spawn_mock_gowa("OUT_1").await;
+
+    let mut config = test_config(&gowa_url, &default_url);
+    // Map the fixture group → channel `support`; everything else falls through to default.
+    config.channels = vec![
+        channel("default", &default_url, WEBHOOK_BEARER),
+        channel("support", &support_url, CHANNEL_A_BEARER),
+    ];
+    config.group_channels = vec![("120363000000000000@g.us".into(), "support".into())];
+    // Forward plain group messages (no mention gate) so the routing is what's under test.
+    config.policy.require_mention = false;
+
+    let state = AppState::new(Arc::new(config)).unwrap();
+    let _worker = state.spawn_forward_worker();
+    let router = build_router(state);
+
+    // 1. A message in the mapped group lands on the `support` agent with channel:"support".
+    assert_eq!(
+        post_webhook(&router, &fixture("group_text_plain.json")).await,
+        StatusCode::OK
+    );
+    wait_for_hits(&support, 1).await;
+    {
+        let bodies = support.bodies.lock().await;
+        assert_eq!(bodies.len(), 1);
+        assert_eq!(bodies[0]["chat_id"], "120363000000000000@g.us");
+        assert_eq!(bodies[0]["channel"], "support");
+    }
+    // It must NOT have reached the default agent.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(default_agent.hits(), 0, "mapped group must not hit default");
+
+    // 2. An unmapped DM lands on the default agent with channel:"default".
+    assert_eq!(
+        post_webhook(&router, &fixture("dm_text.json")).await,
+        StatusCode::OK
+    );
+    wait_for_hits(&default_agent, 1).await;
+    let bodies = default_agent.bodies.lock().await;
+    assert_eq!(bodies.len(), 1);
+    assert_eq!(bodies[0]["chat_id"], "61400111222@s.whatsapp.net");
+    assert_eq!(bodies[0]["channel"], "default");
+    // The mapped channel saw exactly the one group message, not the DM.
+    assert_eq!(
+        support.hits(),
+        1,
+        "default traffic must not hit the mapped channel"
     );
 }
 

@@ -3,9 +3,12 @@
 //! validation errors name the offending *variable*, never its value.
 
 use reqwest::Url;
-use std::{env, net::SocketAddr, path::PathBuf, time::Duration};
+use std::{collections::HashSet, env, net::SocketAddr, path::PathBuf, time::Duration};
 
-use crate::error::DynError;
+use crate::{
+    channel::{ChannelConfig, DEFAULT_CHANNEL},
+    error::DynError,
+};
 
 pub const DEFAULT_BIND: &str = "127.0.0.1:8080";
 pub const DEFAULT_GOWA_URL: &str = "http://127.0.0.1:3000";
@@ -59,6 +62,13 @@ pub struct Config {
     pub forward_concurrency: usize,
     /// Base backoff between forward retries (doubles each attempt, capped internally).
     pub forward_backoff: Duration,
+    /// Configured downstream channels (target endpoints). Always includes the synthesised
+    /// `"default"` channel = today's single target, so an empty `WA_CHANNELS` behaves identically to
+    /// before. See [`crate::channel`].
+    pub channels: Vec<ChannelConfig>,
+    /// Group JID → channel label routing map (from `WA_GROUP_CHANNELS`). Validated at load: every
+    /// label is configured and every JID is a group JID.
+    pub group_channels: Vec<(String, String)>,
 }
 
 /// GOWA HTTP basic-auth pair, parsed from `user:pass`.
@@ -152,7 +162,55 @@ impl Config {
             None => DEFAULT_SEND_RATE_PER_MIN,
         };
 
-        let policy = PolicyConfig::from_env()?;
+        let mut policy = PolicyConfig::from_env()?;
+
+        // --- Channels (all optional → backward compatible) ---
+        // The default channel is always present and equals today's single target, so a config with no
+        // `WA_CHANNELS` builds exactly one channel and behaves identically to before.
+        let mut channels = vec![ChannelConfig {
+            label: DEFAULT_CHANNEL.to_string(),
+            inbound_url: agent_inbound_url.clone(),
+            health_url: agent_health_url.clone(),
+            bearer: whatsapp_webhook_token.clone(),
+        }];
+        let mut label_set: HashSet<String> = HashSet::new();
+        label_set.insert(DEFAULT_CHANNEL.to_string());
+        for label in list("WA_CHANNELS") {
+            validate_channel_label(&label)?;
+            if !label_set.insert(label.clone()) {
+                return Err(boxed(format!(
+                    "WA_CHANNELS lists label {label:?} more than once"
+                )));
+            }
+            let upper = label.to_ascii_uppercase();
+            let url_var = format!("WA_CHANNEL_{upper}_URL");
+            let base = required(&url_var)?.trim_end_matches('/').to_string();
+            let inbound_url = format!("{base}/whatsapp/inbound");
+            validate_url(&url_var, &inbound_url)?;
+            let health_url = format!("{base}/health");
+            // Per-channel bearer is optional (via `secret()`, so `_FILE` works); it defaults to the
+            // shim's single webhook token so two groups pointing at the same agent share its bearer.
+            let bearer = secret(&format!("WA_CHANNEL_{upper}_TOKEN"))
+                .unwrap_or_else(|| whatsapp_webhook_token.clone());
+            channels.push(ChannelConfig {
+                label,
+                inbound_url,
+                health_url,
+                bearer,
+            });
+        }
+
+        let group_channels = parse_group_channels(&env_or("WA_GROUP_CHANNELS", ""))?;
+        validate_group_channel_labels(&group_channels, &label_set)?;
+
+        // Admission convenience: a group you've assigned a channel is implicitly allowlisted, so it
+        // need not also be listed in `WA_GROUP_ALLOW`. Policy itself stays pure — `require_mention`
+        // and `group_policy=off` still apply.
+        for (jid, _label) in &group_channels {
+            if !policy.group_allow.iter().any(|allowed| allowed == jid) {
+                policy.group_allow.push(jid.clone());
+            }
+        }
 
         let readyz_probe_agent = env_bool("SHIM_READYZ_PROBE_AGENT");
         let agent_debug_sink = env_bool("SHIM_DEBUG_SINK");
@@ -188,8 +246,86 @@ impl Config {
             forward_max_retries,
             forward_concurrency,
             forward_backoff,
+            channels,
+            group_channels,
         })
     }
+}
+
+/// Validate a `WA_CHANNELS` label: `[a-z0-9_]`, non-empty, and not the reserved `"default"`.
+fn validate_channel_label(label: &str) -> Result<(), DynError> {
+    if label == DEFAULT_CHANNEL {
+        return Err(boxed(format!(
+            "WA_CHANNELS label {label:?} is reserved (the default channel is implicit)"
+        )));
+    }
+    if label.is_empty()
+        || !label
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+    {
+        return Err(boxed(format!(
+            "WA_CHANNELS label {label:?} must match [a-z0-9_]"
+        )));
+    }
+    Ok(())
+}
+
+/// Parse `WA_GROUP_CHANNELS` (`<jid>:<label>,<jid>:<label>`) into `(jid, label)` pairs. Pure (no
+/// env), so it is unit-testable. Validates structure, that each JID is a group JID (`@g.us`), and
+/// that no JID is mapped twice. Label-membership (does the label name a configured channel?) is a
+/// separate check — see [`validate_group_channel_labels`] — because it needs the channel set.
+pub fn parse_group_channels(raw: &str) -> Result<Vec<(String, String)>, DynError> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for entry in raw.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        // Split on the LAST colon: labels are `[a-z0-9_]` (colon-free) and group JIDs carry no
+        // colon, so this cleanly separates `<jid>:<label>` either way.
+        let (jid, label) = entry.rsplit_once(':').ok_or_else(|| {
+            boxed(format!(
+                "WA_GROUP_CHANNELS entry {entry:?} must be '<jid>:<label>'"
+            ))
+        })?;
+        let jid = jid.trim();
+        let label = label.trim();
+        if jid.is_empty() || label.is_empty() {
+            return Err(boxed(format!(
+                "WA_GROUP_CHANNELS entry {entry:?} has an empty jid or label"
+            )));
+        }
+        if !jid.ends_with(GROUP_SUFFIX) {
+            return Err(boxed(format!(
+                "WA_GROUP_CHANNELS jid {jid:?} is not a group JID (must end with {GROUP_SUFFIX})"
+            )));
+        }
+        if !seen.insert(jid.to_string()) {
+            return Err(boxed(format!(
+                "WA_GROUP_CHANNELS maps jid {jid:?} more than once"
+            )));
+        }
+        out.push((jid.to_string(), label.to_string()));
+    }
+    Ok(out)
+}
+
+/// Ensure every label in a parsed group→channel map names a configured channel. Pure (the label set
+/// is passed in) so it is unit-testable without the environment.
+fn validate_group_channel_labels(
+    mappings: &[(String, String)],
+    known_labels: &HashSet<String>,
+) -> Result<(), DynError> {
+    for (jid, label) in mappings {
+        if !known_labels.contains(label) {
+            return Err(boxed(format!(
+                "WA_GROUP_CHANNELS maps {jid:?} to unknown channel {label:?} (not in WA_CHANNELS)"
+            )));
+        }
+    }
+    Ok(())
 }
 
 impl BasicAuth {
@@ -417,6 +553,68 @@ mod tests {
             None
         );
         let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
+    fn parse_group_channels_happy_path() {
+        let parsed =
+            parse_group_channels(" 120363000000000000@g.us:support , 120363111111111111@g.us:ops ")
+                .unwrap();
+        assert_eq!(
+            parsed,
+            vec![
+                ("120363000000000000@g.us".to_string(), "support".to_string()),
+                ("120363111111111111@g.us".to_string(), "ops".to_string()),
+            ]
+        );
+        // Empty / whitespace input → no mappings (the default-only case).
+        assert!(parse_group_channels("").unwrap().is_empty());
+        assert!(parse_group_channels("   ").unwrap().is_empty());
+    }
+
+    #[test]
+    fn parse_group_channels_rejects_non_group_jid() {
+        // A DM JID is not routable per-group.
+        let error = parse_group_channels("61400111222@s.whatsapp.net:support")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not a group JID"));
+        // A missing colon is malformed.
+        assert!(parse_group_channels("120363000000000000@g.us").is_err());
+    }
+
+    #[test]
+    fn parse_group_channels_rejects_duplicate_jid() {
+        let error =
+            parse_group_channels("120363000000000000@g.us:support,120363000000000000@g.us:ops")
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("more than once"));
+    }
+
+    #[test]
+    fn validate_group_channel_labels_rejects_unknown_label() {
+        let known: HashSet<String> = [DEFAULT_CHANNEL.to_string(), "support".to_string()]
+            .into_iter()
+            .collect();
+        let ok = vec![("120363000000000000@g.us".to_string(), "support".to_string())];
+        assert!(validate_group_channel_labels(&ok, &known).is_ok());
+
+        let unknown = vec![("120363000000000000@g.us".to_string(), "nope".to_string())];
+        let error = validate_group_channel_labels(&unknown, &known)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unknown channel"));
+    }
+
+    #[test]
+    fn validate_channel_label_enforces_charset_and_reserved() {
+        assert!(validate_channel_label("support").is_ok());
+        assert!(validate_channel_label("ops_2").is_ok());
+        assert!(validate_channel_label("default").is_err()); // reserved
+        assert!(validate_channel_label("Support").is_err()); // uppercase
+        assert!(validate_channel_label("a-b").is_err()); // hyphen not allowed
+        assert!(validate_channel_label("").is_err());
     }
 
     #[test]
