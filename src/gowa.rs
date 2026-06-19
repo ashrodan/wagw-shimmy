@@ -12,8 +12,9 @@
 //!   turn on it, but the shim still surfaces a non-2xx so the caller can log.
 
 use hmac::{Hmac, Mac};
-use reqwest::{Client, StatusCode};
+use reqwest::{Client, StatusCode, multipart};
 use serde::Serialize;
+use serde_json::{Value, json};
 use sha2::Sha256;
 use std::time::Duration;
 
@@ -26,6 +27,10 @@ type HmacSha256 = Hmac<Sha256>;
 
 /// Short bound on a readiness probe — a wedged dependency must not stall `/readyz`.
 const PING_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Upper bound on a media file the `/media` proxy will stream from GOWA. GOWA is a trusted loopback
+/// peer, but this caps the memory a single proxied request can force us to buffer.
+const MAX_MEDIA_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Verify a GOWA `X-Hub-Signature-256` header against the raw body. Returns `false` for a missing
 /// prefix, non-hex signature, or any mismatch. The comparison itself is constant-time
@@ -63,8 +68,44 @@ pub struct GowaClient {
     send_url: String,
     presence_url: String,
     devices_url: String,
+    image_url: String,
+    audio_url: String,
+    file_url: String,
+    /// GOWA base URL (no trailing slash); the media proxy fetches `{statics_base}/{gowa_path}`.
+    statics_base: String,
     device_id: String,
     basic_auth: Option<BasicAuth>,
+}
+
+/// The bytes (and how to serve them) for one outbound media send: either a public URL GOWA fetches
+/// itself, or in-band bytes the shim uploads to GOWA as multipart.
+pub enum MediaSource {
+    /// A publicly-reachable URL → GOWA's `{kind}_url` JSON field; GOWA downloads it.
+    Url(String),
+    /// Decoded bytes → a multipart file upload to GOWA.
+    Bytes {
+        data: Vec<u8>,
+        filename: String,
+        mime: Option<String>,
+    },
+}
+
+/// Optional knobs shared by the media sends. `caption` applies to image/file; `voice` (PTT) to
+/// audio; `reply_to` quotes a message on any of them.
+#[derive(Default)]
+pub struct SendMediaOpts {
+    pub caption: Option<String>,
+    pub reply_to: Option<String>,
+    /// Send audio as a push-to-talk voice note (GOWA `ptt`). Ignored by image/file.
+    pub voice: bool,
+}
+
+/// A proxied static fetch from GOWA: the upstream status, its `Content-Type` (if any), and the body
+/// bytes. The `/media` handler forwards all three so the agent sees GOWA's own content type.
+pub struct StaticFetch {
+    pub status: StatusCode,
+    pub content_type: Option<String>,
+    pub body: Vec<u8>,
 }
 
 impl GowaClient {
@@ -82,6 +123,10 @@ impl GowaClient {
             send_url: format!("{}/send/message", config.gowa_url),
             presence_url: format!("{}/send/chat-presence", config.gowa_url),
             devices_url: format!("{}/devices", config.gowa_url),
+            image_url: format!("{}/send/image", config.gowa_url),
+            audio_url: format!("{}/send/audio", config.gowa_url),
+            file_url: format!("{}/send/file", config.gowa_url),
+            statics_base: config.gowa_url.clone(),
             device_id: config.gowa_device_id.clone(),
             basic_auth: config.gowa_basic_auth.clone(),
         })
@@ -130,21 +175,151 @@ impl GowaClient {
 
         let status = response.status();
         let raw = response.text().await.unwrap_or_default();
-        if status.is_success() {
-            return Ok(extract_message_id(&raw));
+        classify_send(status, &raw, "send")
+    }
+
+    /// Send an image to a JID. `source` is either a public URL (GOWA's `image_url`, fetched by GOWA)
+    /// or in-band bytes uploaded as multipart. `caption` and `reply_to` are honoured; `voice` is not.
+    pub async fn send_image(
+        &self,
+        phone: &str,
+        source: MediaSource,
+        opts: SendMediaOpts,
+    ) -> Result<String, HttpError> {
+        self.post_media(&self.image_url, "image", "image_url", phone, source, &opts)
+            .await
+    }
+
+    /// Send audio to a JID. Set `opts.voice` to deliver it as a push-to-talk voice note (GOWA `ptt`).
+    pub async fn send_audio(
+        &self,
+        phone: &str,
+        source: MediaSource,
+        opts: SendMediaOpts,
+    ) -> Result<String, HttpError> {
+        self.post_media(&self.audio_url, "audio", "audio_url", phone, source, &opts)
+            .await
+    }
+
+    /// Send an arbitrary file/document to a JID. `caption` and `reply_to` are honoured.
+    pub async fn send_file(
+        &self,
+        phone: &str,
+        source: MediaSource,
+        opts: SendMediaOpts,
+    ) -> Result<String, HttpError> {
+        self.post_media(&self.file_url, "file", "file_url", phone, source, &opts)
+            .await
+    }
+
+    /// Shared body of the three media sends. `field` is GOWA's multipart file field (`image`/`audio`/
+    /// `file`); `url_field` is the JSON URL field (`image_url`/…). A [`MediaSource::Url`] sends JSON;
+    /// [`MediaSource::Bytes`] sends multipart. Error/id handling mirrors [`Self::send_message`].
+    async fn post_media(
+        &self,
+        url: &str,
+        field: &str,
+        url_field: &str,
+        phone: &str,
+        source: MediaSource,
+        opts: &SendMediaOpts,
+    ) -> Result<String, HttpError> {
+        let mut request = self.http.post(url).header("X-Device-Id", &self.device_id);
+        if let Some(auth) = &self.basic_auth {
+            request = request.basic_auth(&auth.user, Some(&auth.pass));
         }
-        let snippet = raw.chars().take(300).collect::<String>();
-        if status.is_client_error() && status != StatusCode::TOO_MANY_REQUESTS {
-            // A 4xx (other than 429) is a request the agent could fix — surface as BadRequest.
-            Err(HttpError::BadRequest(format!(
-                "GOWA rejected send ({status}): {snippet}"
-            )))
-        } else {
-            // 5xx, 429, or anything else — transient/gateway, retryable.
-            Err(HttpError::Upstream(format!(
-                "GOWA send failed ({status}): {snippet}"
-            )))
+
+        request = match source {
+            MediaSource::Url(media_url) => {
+                let mut body = serde_json::Map::new();
+                body.insert("phone".to_string(), json!(phone));
+                body.insert(url_field.to_string(), json!(media_url));
+                if let Some(caption) = non_empty(opts.caption.as_deref()) {
+                    body.insert("caption".to_string(), json!(caption));
+                }
+                if opts.voice {
+                    body.insert("ptt".to_string(), Value::Bool(true));
+                }
+                if let Some(reply) = non_empty(opts.reply_to.as_deref()) {
+                    body.insert("reply_message_id".to_string(), json!(reply));
+                }
+                request.json(&Value::Object(body))
+            }
+            MediaSource::Bytes {
+                data,
+                filename,
+                mime,
+            } => {
+                let mut part = multipart::Part::bytes(data).file_name(filename);
+                if let Some(mime) = mime.as_deref().filter(|value| !value.is_empty()) {
+                    part = part.mime_str(mime).map_err(|error| {
+                        HttpError::BadRequest(format!("invalid media mime: {error}"))
+                    })?;
+                }
+                let mut form = multipart::Form::new()
+                    .text("phone", phone.to_string())
+                    .part(field.to_string(), part);
+                if let Some(caption) = non_empty(opts.caption.as_deref()) {
+                    form = form.text("caption", caption.to_string());
+                }
+                if opts.voice {
+                    form = form.text("ptt", "true");
+                }
+                if let Some(reply) = non_empty(opts.reply_to.as_deref()) {
+                    form = form.text("reply_message_id", reply.to_string());
+                }
+                request.multipart(form)
+            }
+        };
+
+        let response = request.send().await.map_err(|error| {
+            HttpError::Upstream(format!("GOWA media request failed: {}", classify(&error)))
+        })?;
+        let status = response.status();
+        let raw = response.text().await.unwrap_or_default();
+        classify_send(status, &raw, "media send")
+    }
+
+    /// Proxy-fetch a GOWA static media file for the `/media` route. `path` is the verified
+    /// GOWA-relative path (`statics/media/<file>`); the fetch is `GET {statics_base}/{path}`. GOWA
+    /// serves `/statics/...` without basic auth (mounted before its auth middleware) but the header
+    /// is sent anyway, harmlessly, for robustness. A transport failure → `Upstream`; an oversized
+    /// body (by `Content-Length` or actual bytes) → `BadRequest`. Any HTTP status is returned as-is
+    /// in [`StaticFetch`] so the handler can forward a GOWA 404 as a 404.
+    pub async fn fetch_static(&self, path: &str) -> Result<StaticFetch, HttpError> {
+        let url = format!("{}/{}", self.statics_base, path.trim_start_matches('/'));
+        let mut request = self.http.get(&url);
+        if let Some(auth) = &self.basic_auth {
+            request = request.basic_auth(&auth.user, Some(&auth.pass));
         }
+        let response = request.send().await.map_err(|error| {
+            HttpError::Upstream(format!("GOWA static fetch failed: {}", classify(&error)))
+        })?;
+
+        let status = response.status();
+        if let Some(len) = response.content_length()
+            && len > MAX_MEDIA_BYTES
+        {
+            return Err(HttpError::BadRequest(format!(
+                "GOWA media too large ({len} bytes)"
+            )));
+        }
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let bytes = response.bytes().await.map_err(|error| {
+            HttpError::Upstream(format!("GOWA static read failed: {}", classify(&error)))
+        })?;
+        if bytes.len() as u64 > MAX_MEDIA_BYTES {
+            return Err(HttpError::BadRequest("GOWA media too large".to_string()));
+        }
+        Ok(StaticFetch {
+            status,
+            content_type,
+            body: bytes.to_vec(),
+        })
     }
 
     /// Set a chat presence (`action` is `"start"`/`"stop"` — typing indicator) for `phone` (the
@@ -230,6 +405,32 @@ fn extract_message_id(raw: &str) -> String {
         .and_then(|id| id.as_str())
         .unwrap_or_default()
         .to_string()
+}
+
+/// Classify a GOWA send-style response into the message id (on 2xx) or an [`HttpError`]: a 4xx other
+/// than 429 is a request the agent could fix (`BadRequest`, not retried); 5xx/429/anything else is
+/// transient (`Upstream`, retryable). `action` names the call for the error text. Shared by the text
+/// and media sends so both classify identically.
+fn classify_send(status: StatusCode, raw: &str, action: &str) -> Result<String, HttpError> {
+    if status.is_success() {
+        return Ok(extract_message_id(raw));
+    }
+    let snippet = raw.chars().take(300).collect::<String>();
+    if status.is_client_error() && status != StatusCode::TOO_MANY_REQUESTS {
+        Err(HttpError::BadRequest(format!(
+            "GOWA rejected {action} ({status}): {snippet}"
+        )))
+    } else {
+        Err(HttpError::Upstream(format!(
+            "GOWA {action} failed ({status}): {snippet}"
+        )))
+    }
+}
+
+/// Trim a borrowed optional string, treating all-whitespace as absent. Mirrors `config`/`model`'s
+/// `non_empty` discipline; used to drop empty caption/reply fields from a media send.
+fn non_empty(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
 }
 
 fn classify(error: &reqwest::Error) -> String {

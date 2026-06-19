@@ -40,7 +40,7 @@ async fn run() -> Result<(), DynError> {
     let listener = TcpListener::bind(bind).await?;
     tracing::info!(%bind, "wagw-shimmy listening");
     tracing::info!(
-        "routes: POST /webhook/gowa, POST /send, POST /send/chat-presence, GET /livez, GET /readyz, GET /healthz"
+        "routes: POST /webhook/gowa, POST /send, POST /send/chat-presence, POST /send/{{image,audio,file}}, GET /media/{{token}}, GET /livez, GET /readyz, GET /healthz"
     );
 
     axum::serve(listener, app)

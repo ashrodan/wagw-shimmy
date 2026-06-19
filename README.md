@@ -42,6 +42,7 @@ Envelope: `{ "event": "...", "device_id": "...", "payload": { … } }`. Fields t
 | `id`            | message id — dedup key; the agent echoes it back as `reply_to`.          |
 | `is_from_me`    | `true` → the bot's own echo; dropped.                                    |
 | `replied_to_id` | id of the quoted message → powers reply-to-bot mention detection.        |
+| `image`/`audio`/`document` | media attachment (string path or `{path,caption}` object) → forwarded as `media[]`. |
 
 `status@broadcast` and `…@newsletter` chats are dropped. Deserialisation is lenient (all fields
 optional, unknowns ignored) so a payload-shape drift degrades to a dropped message, not a 500.
@@ -106,6 +107,27 @@ GOWA **4xx** (except 429) maps to **400** `bad_request` (the agent shouldn't ret
 timeout / connection** maps to **502** `upstream` (retryable). The agent presents `WHATSAPP_GATEWAY_TOKEN`
 as a bearer; missing/wrong → 401.
 
+## Media (images, audio, documents)
+
+Both directions, text-and-media. The bytes never travel in the forward JSON or the durable queue —
+the shim re-serves them.
+
+- **Inbound.** GOWA auto-downloads media to its loopback `statics/media/<file>`; the shim can't put
+  that on the agent's box, so it adds `media:[{type,url,mime,filename}]` to the forward where `url`
+  is `{SHIM_MEDIA_BASE_URL}/media/<token>` back at the shim. A caption folds into `body`. The agent
+  GETs that URL (with the `/send` bearer) and the shim **proxy-streams** the file from GOWA, with
+  GOWA's own `Content-Type`. The `<token>` is a stateless HMAC over the GOWA-relative path (keyed by
+  `GOWA_WEBHOOK_SECRET`), so the proxy holds no server state, survives a restart, and can't be forged
+  or steered outside `statics/media/` (bad token → 403, missing bearer → 401).
+- **Outbound.** `POST /send/{image,audio,file}` with `{to|chat_id, media_url|media_base64, caption?,
+  filename?, reply_to?, voice?}` (bearer + rate-limited, like `/send`). `media_url` → GOWA's
+  `{kind}_url` (GOWA fetches it); `media_base64` → a multipart upload to GOWA. `voice:true` sends
+  audio as a push-to-talk voice note.
+
+`SHIM_MEDIA_BASE_URL` (default `http://{SHIM_BIND}`) must equal the agent's `WHATSAPP_GATEWAY_URL`.
+Auto-download-off (CDN-URL inbound) and video/sticker are out of scope; see [`docs/HARDENING.md`](docs/HARDENING.md).
+Full normative shape in [`docs/AGENT-WHATSAPP-CONTRACT.md`](docs/AGENT-WHATSAPP-CONTRACT.md).
+
 ## Configuration
 
 See [`.env.example`](.env.example) for the full list. Boot is fail-fast: a missing secret, bad URL,
@@ -119,7 +141,7 @@ The agent's `WHATSAPP_GATEWAY_URL` points at the shim (`http://127.0.0.1:8080`).
 
 ```sh
 cargo build
-cargo test                  # 27 unit + 10 e2e; no network, no WA account, no API spend
+cargo test                  # 60 unit + 29 e2e; no network, no WA account, no API spend
 cargo clippy --all-targets  # CI-equivalent gate — keep clean
 ```
 

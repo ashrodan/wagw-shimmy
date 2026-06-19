@@ -232,6 +232,9 @@ fn test_config(gowa_url: &str, agent_base: &str) -> Config {
         // Default-only routing (matches a config with no WA_CHANNELS): one channel = today's target.
         channels: vec![channel("default", agent_base, WEBHOOK_BEARER)],
         group_channels: vec![],
+        // A fixed base so a forwarded media URL is parseable; the `/media` handler keys off the token
+        // alone, so its value doesn't matter to the in-process oneshot tests.
+        media_base_url: "http://shim.test".into(),
         self_number: None,
     }
 }
@@ -252,6 +255,7 @@ fn test_inbound(chat_id: &str, body: &str, id: &str) -> Inbound {
         reply_to: None,
         quoted_body: None,
         channel: "default".into(),
+        media: vec![],
     }
 }
 
@@ -886,6 +890,321 @@ async fn mapped_group_routes_to_its_channel_and_others_default() {
         support.hits(),
         1,
         "default traffic must not hit the mapped channel"
+    );
+}
+
+// --- Media (inbound proxy + outbound send) ---
+
+use base64::{Engine, engine::general_purpose::STANDARD};
+
+/// Bytes the mock GOWA serves from `/statics/media/...`; the proxy must stream these back verbatim.
+const MEDIA_BYTES: &[u8] = b"FAKE-JPEG-BYTES-0123456789";
+
+/// Records the raw body + content-type of each request (so a JSON `image_url` send can be told apart
+/// from a multipart upload). A thin sibling of [`Recorder`] for the media-send mocks.
+#[derive(Clone, Default)]
+struct RawRecorder {
+    content_types: Arc<Mutex<Vec<String>>>,
+    bodies: Arc<Mutex<Vec<Vec<u8>>>>,
+    count: Arc<AtomicUsize>,
+}
+
+impl RawRecorder {
+    async fn record(&self, content_type: String, body: Vec<u8>) {
+        self.content_types.lock().await.push(content_type);
+        self.bodies.lock().await.push(body);
+        self.count.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn hits(&self) -> usize {
+        self.count.load(Ordering::SeqCst)
+    }
+}
+
+/// A mock GOWA send-media endpoint: records what it received and returns a fixed message id.
+async fn record_media_send(
+    State(rec): State<RawRecorder>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Json<Value> {
+    let content_type = headers
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    rec.record(content_type, body.to_vec()).await;
+    Json(json!({ "code": "SUCCESS", "results": { "message_id": "OUT_MEDIA_1" } }))
+}
+
+/// Spawn a mock GOWA covering the media surface: `/send/{image,audio,file}` (recorded),
+/// `/statics/media/<file>` (serves [`MEDIA_BYTES`] as `image/jpeg`), plus `/send/message` + `/devices`.
+async fn spawn_mock_gowa_media() -> (String, RawRecorder) {
+    let rec = RawRecorder::default();
+    let app = Router::new()
+        .route("/send/image", post(record_media_send))
+        .route("/send/audio", post(record_media_send))
+        .route("/send/file", post(record_media_send))
+        .route(
+            "/send/message",
+            post(|Json(_body): Json<Value>| async {
+                Json(json!({ "code": "SUCCESS", "results": { "message_id": "OUT_TEXT_1" } }))
+            }),
+        )
+        .route(
+            "/statics/media/{file}",
+            axum::routing::get(|| async {
+                (
+                    [(axum::http::header::CONTENT_TYPE, "image/jpeg")],
+                    MEDIA_BYTES,
+                )
+            }),
+        )
+        .route(
+            "/devices",
+            axum::routing::get(|| async { Json(json!({ "results": [] })) }),
+        )
+        .with_state(rec.clone());
+    let addr = serve(app).await;
+    (format!("http://{addr}"), rec)
+}
+
+async fn wait_for_raw_hits(rec: &RawRecorder, want: usize) {
+    for _ in 0..100 {
+        if rec.hits() >= want {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Build a GET request to the proxy with an optional gateway bearer.
+fn media_get(token: &str, bearer: Option<&str>) -> Request<Body> {
+    let mut builder = Request::builder()
+        .method("GET")
+        .uri(format!("/media/{token}"));
+    if let Some(bearer) = bearer {
+        builder = builder.header("authorization", format!("Bearer {bearer}"));
+    }
+    builder.body(Body::empty()).unwrap()
+}
+
+#[tokio::test]
+async fn inbound_image_forwards_media_and_proxy_serves_bytes() {
+    let (agent_url, agent) = spawn_mock_agent().await;
+    let (gowa_url, _gowa) = spawn_mock_gowa_media().await;
+    let state = state_for(&gowa_url, &agent_url).await;
+    let _worker = state.spawn_forward_worker();
+    let router = build_router(state);
+
+    assert_eq!(
+        post_webhook(&router, &fixture("image_dm.json")).await,
+        StatusCode::OK
+    );
+    wait_for_hits(&agent, 1).await;
+
+    // The forward carries a media[] entry with a /media/<token> URL and the folded caption as body.
+    let url = {
+        let bodies = agent.bodies.lock().await;
+        assert_eq!(bodies.len(), 1);
+        assert_eq!(bodies[0]["body"], "check this out");
+        let media = &bodies[0]["media"];
+        assert_eq!(media[0]["type"], "image");
+        assert_eq!(media[0]["mime"], "image/jpeg");
+        assert_eq!(media[0]["filename"], "abc123.jpg");
+        media[0]["url"].as_str().unwrap().to_string()
+    };
+    let token = url
+        .strip_prefix("http://shim.test/media/")
+        .unwrap_or_else(|| panic!("unexpected media url {url}"))
+        .to_string();
+
+    // GET the proxy URL with the gateway bearer → the GOWA static bytes + its content-type.
+    let resp = router
+        .clone()
+        .oneshot(media_get(&token, Some(GATEWAY_BEARER)))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers().get("content-type").unwrap(), "image/jpeg");
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(bytes.as_ref(), MEDIA_BYTES);
+
+    // Missing bearer → 401.
+    let resp = router
+        .clone()
+        .oneshot(media_get(&token, None))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // A tampered token (flip the last tag char) → 403.
+    let mut tampered = token.clone();
+    let last = tampered.pop().unwrap();
+    tampered.push(if last == '0' { '1' } else { '0' });
+    let resp = router
+        .clone()
+        .oneshot(media_get(&tampered, Some(GATEWAY_BEARER)))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    // A correctly-signed but traversing path → 403 (verify rejects `..`).
+    let evil =
+        wagw_shimmy::media::sign(WEBHOOK_SECRET.as_bytes(), "statics/media/../../etc/passwd");
+    let resp = router
+        .oneshot(media_get(&evil, Some(GATEWAY_BEARER)))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn send_image_url_forwards_to_gowa_as_json_image_url() {
+    let (agent_url, _agent) = spawn_mock_agent().await;
+    let (gowa_url, gowa) = spawn_mock_gowa_media().await;
+    let router = build_router(state_for(&gowa_url, &agent_url).await);
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/send/image")
+        .header("authorization", format!("Bearer {GATEWAY_BEARER}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({
+                "chat_id": "61400111222@s.whatsapp.net",
+                "media_url": "https://example.com/pic.jpg",
+                "caption": "look",
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let resp = router.oneshot(request).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    wait_for_raw_hits(&gowa, 1).await;
+    let content_types = gowa.content_types.lock().await;
+    let bodies = gowa.bodies.lock().await;
+    assert!(
+        content_types[0].starts_with("application/json"),
+        "url form must be JSON, got {}",
+        content_types[0]
+    );
+    let body = String::from_utf8_lossy(&bodies[0]);
+    assert!(
+        body.contains("image_url"),
+        "GOWA must see image_url: {body}"
+    );
+    assert!(body.contains("https://example.com/pic.jpg"));
+    assert!(body.contains("\"caption\":\"look\""));
+}
+
+#[tokio::test]
+async fn send_image_base64_uploads_multipart_to_gowa() {
+    let (agent_url, _agent) = spawn_mock_agent().await;
+    let (gowa_url, gowa) = spawn_mock_gowa_media().await;
+    let router = build_router(state_for(&gowa_url, &agent_url).await);
+
+    let raw = "hello-image-bytes-xyz";
+    let encoded = STANDARD.encode(raw.as_bytes());
+    let request = Request::builder()
+        .method("POST")
+        .uri("/send/image")
+        .header("authorization", format!("Bearer {GATEWAY_BEARER}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({
+                "chat_id": "61400111222@s.whatsapp.net",
+                "media_base64": encoded,
+                "filename": "pic.jpg",
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let resp = router.oneshot(request).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    wait_for_raw_hits(&gowa, 1).await;
+    let content_types = gowa.content_types.lock().await;
+    let bodies = gowa.bodies.lock().await;
+    assert!(
+        content_types[0].starts_with("multipart/form-data"),
+        "base64 form must be a multipart upload, got {}",
+        content_types[0]
+    );
+    let body = String::from_utf8_lossy(&bodies[0]);
+    // The decoded file bytes ride in the multipart payload under the `image` file field.
+    assert!(
+        body.contains(raw),
+        "uploaded file bytes missing from multipart body"
+    );
+    assert!(body.contains("name=\"image\""));
+    assert!(body.contains("pic.jpg"));
+}
+
+#[tokio::test]
+async fn send_image_requires_bearer() {
+    let (agent_url, _agent) = spawn_mock_agent().await;
+    let (gowa_url, gowa) = spawn_mock_gowa_media().await;
+    let router = build_router(state_for(&gowa_url, &agent_url).await);
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/send/image")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({"chat_id":"x@s.whatsapp.net","media_url":"https://example.com/p.jpg"})
+                .to_string(),
+        ))
+        .unwrap();
+    let status = router.oneshot(request).await.unwrap().status();
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        gowa.hits(),
+        0,
+        "unauthenticated media send must not reach GOWA"
+    );
+}
+
+#[tokio::test]
+async fn media_send_consumes_the_send_budget() {
+    // Inverse of `chat_presence_does_not_consume_send_budget`: a media send DOES spend the budget.
+    let (agent_url, _agent) = spawn_mock_agent().await;
+    let (gowa_url, _gowa) = spawn_mock_gowa_media().await;
+    let mut config = test_config(&gowa_url, &agent_url);
+    config.send_rate_per_min = 1;
+    let router = build_router(AppState::new(Arc::new(config)).unwrap());
+
+    // The single token goes to the media send.
+    let media = Request::builder()
+        .method("POST")
+        .uri("/send/image")
+        .header("authorization", format!("Bearer {GATEWAY_BEARER}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({"chat_id":"x@s.whatsapp.net","media_url":"https://example.com/p.jpg"})
+                .to_string(),
+        ))
+        .unwrap();
+    assert_eq!(
+        router.clone().oneshot(media).await.unwrap().status(),
+        StatusCode::OK
+    );
+
+    // A following text send is now rate-limited — the media send spent the budget.
+    let text = Request::builder()
+        .method("POST")
+        .uri("/send")
+        .header("authorization", format!("Bearer {GATEWAY_BEARER}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({"chat_id":"x@s.whatsapp.net","text":"hi"}).to_string(),
+        ))
+        .unwrap();
+    assert_eq!(
+        router.oneshot(text).await.unwrap().status(),
+        StatusCode::TOO_MANY_REQUESTS
     );
 }
 

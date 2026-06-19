@@ -69,6 +69,11 @@ pub struct Config {
     /// Group JID → channel label routing map (from `WA_GROUP_CHANNELS`). Validated at load: every
     /// label is configured and every JID is a group JID.
     pub group_channels: Vec<(String, String)>,
+    /// Base URL the agent fetches inbound media from — the shim's own `/media` proxy. From
+    /// `SHIM_MEDIA_BASE_URL`, defaulting to `http://{SHIM_BIND}`. **Must equal the agent's
+    /// `WHATSAPP_GATEWAY_URL`** (the agent GETs `{media_base}/media/<token>` with the gateway
+    /// bearer). Validated as a URL; trailing slash trimmed.
+    pub media_base_url: String,
     /// The bot's own WhatsApp number, digits only (e.g. `61413118079`), from `WA_SELF_NUMBER`.
     /// Used to detect a group `@`-mention of the bot: GOWA rewrites a tag into the message body as
     /// `@<number>` (see the vendored `event_message.go`), so a tag of the bot appears as
@@ -209,6 +214,14 @@ impl Config {
         let group_channels = parse_group_channels(&env_or("WA_GROUP_CHANNELS", ""))?;
         validate_group_channel_labels(&group_channels, &label_set)?;
 
+        // Media proxy base — what the agent GETs inbound media from. Defaults to the listener, since
+        // the agent's `WHATSAPP_GATEWAY_URL` (where it sends `/send`) is the same shim base URL.
+        let media_base_url = match optional("SHIM_MEDIA_BASE_URL") {
+            Some(raw) => raw.trim_end_matches('/').to_string(),
+            None => format!("http://{bind}"),
+        };
+        validate_url("SHIM_MEDIA_BASE_URL", &media_base_url)?;
+
         // The bot's own number, for group `@`-mention detection (see `Config::self_number`).
         let self_number = optional("WA_SELF_NUMBER")
             .map(|raw| normalise_self_number(&raw))
@@ -259,6 +272,7 @@ impl Config {
             forward_backoff,
             channels,
             group_channels,
+            media_base_url,
             self_number,
         })
     }

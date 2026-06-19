@@ -19,6 +19,7 @@ use crate::{config::Config, error::DynError, model::Inbound};
 /// The exact JSON the agent's WhatsApp channel deserialises. Field names are fixed by that contract.
 /// `channel` is a new, additive field: the agent ignores unknown fields today (its request type is a
 /// plain `Deserialize` with no `deny_unknown_fields`), so it can persona-differentiate on it later.
+/// `media` is likewise additive and omitted entirely for a text-only message.
 #[derive(Serialize)]
 struct InboundForward<'a> {
     chat_id: &'a str,
@@ -26,6 +27,21 @@ struct InboundForward<'a> {
     id: &'a str,
     from_me: bool,
     channel: &'a str,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    media: Vec<ForwardMedia>,
+}
+
+/// One media attachment as the agent sees it: a `type`, a fetchable `url` (back at the shim's
+/// `/media` proxy, bearer-gated), and best-effort `mime`/`filename`. The agent GETs `url` lazily to
+/// pull the bytes — they are never inlined into this JSON or the durable queue.
+#[derive(Serialize)]
+struct ForwardMedia {
+    r#type: String,
+    url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mime: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    filename: Option<String>,
 }
 
 /// What [`AgentClient::forward`] actually did, so the worker logs the truth. In debug-sink mode the
@@ -48,6 +64,12 @@ pub struct AgentClient {
     bearer: String,
     /// Debug sink mode: log the forward and succeed instead of calling the agent (see `Config`).
     debug_sink: bool,
+    /// Base URL the agent fetches inbound media from (the shim's own `/media` proxy), e.g.
+    /// `http://127.0.0.1:8080`. Forward URLs are `{media_base}/media/<signed-token>`.
+    media_base: String,
+    /// Key the `/media` token is signed with — the per-tenant `GOWA_WEBHOOK_SECRET` (reused; see
+    /// [`crate::media`]). Held as bytes-able `String`; never logged.
+    media_signing_key: String,
 }
 
 impl AgentClient {
@@ -61,6 +83,8 @@ impl AgentClient {
         health_url: String,
         bearer: String,
         debug_sink: bool,
+        media_base: String,
+        media_signing_key: String,
     ) -> Result<Self, DynError> {
         let http = Client::builder()
             .timeout(Duration::from_secs(120))
@@ -76,6 +100,8 @@ impl AgentClient {
             health_url,
             bearer,
             debug_sink,
+            media_base,
+            media_signing_key,
         })
     }
 
@@ -87,7 +113,29 @@ impl AgentClient {
             config.agent_health_url.clone(),
             config.whatsapp_webhook_token.clone(),
             config.agent_debug_sink,
+            config.media_base_url.clone(),
+            config.gowa_webhook_secret.clone(),
         )
+    }
+
+    /// Build the forwarded media list for an inbound: each item's `/media` URL is signed *here, at
+    /// forward time* (not stored), so a `SHIM_MEDIA_BASE_URL` change needs no re-enqueue and the
+    /// token survives a restart (it's stateless — see [`crate::media`]).
+    fn build_forward_media(&self, inbound: &Inbound) -> Vec<ForwardMedia> {
+        inbound
+            .media
+            .iter()
+            .map(|item| ForwardMedia {
+                r#type: item.kind.clone(),
+                url: format!(
+                    "{}/media/{}",
+                    self.media_base,
+                    crate::media::sign(self.media_signing_key.as_bytes(), &item.gowa_path)
+                ),
+                mime: item.mime.clone(),
+                filename: item.filename.clone(),
+            })
+            .collect()
     }
 
     /// Optional readiness probe: a short-timeout `GET /health` (the agent exposes `/health`, not
@@ -109,6 +157,7 @@ impl AgentClient {
         // The forwarded text is the composed agent body: when the message is a reply, the quoted
         // text is prepended so the agent sees what the user was replying to, not just a bare @tag.
         let agent_body = inbound.agent_body();
+        let media = self.build_forward_media(inbound);
 
         // Debug sink: no agent target. Log the exact contract that *would* be forwarded and report
         // success so the durable queue drains cleanly (nothing dead-letters). Validates the
@@ -119,6 +168,7 @@ impl AgentClient {
                 id = %inbound.id,
                 from_me = inbound.is_from_me,
                 channel = %inbound.channel,
+                media = media.len(),
                 body = %agent_body,
                 "DEBUG SINK: accepted inbound (no agent target) — would forward this contract"
             );
@@ -131,6 +181,7 @@ impl AgentClient {
             id: &inbound.id,
             from_me: inbound.is_from_me,
             channel: &inbound.channel,
+            media,
         };
 
         let response = self

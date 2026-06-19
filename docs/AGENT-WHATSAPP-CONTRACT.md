@@ -46,10 +46,39 @@ endpoint and `spike-rust-agent.exe.xyz` 404 on `/whatsapp/inbound`.
   | `id` | string | message id — idempotency key; usable as `reply_to` to quote |
   | `from_me` | bool | always `false` in practice (shim drops own echoes); MUST be tolerated |
   | `channel` | string | per-group routing label (`"default"` or e.g. `"support"`). New, additive. |
+  | `media` | array | media attachments (image/audio/document). Omitted entirely when none. New, additive. |
 
   The agent MUST ignore unknown fields (no `deny_unknown_fields`). Field aliases already accepted by
   the agent (`from`/`sender`, `message_id`, `text`/`message`) MAY remain but the shim only sends the
-  five above.
+  fields above.
+
+#### Inbound media — `media[]` + `GET /media/<token>` (shim → agent)
+
+When the WhatsApp user sends an image, voice note, or document, the shim adds a `media` array; each
+element is:
+
+| field | type | notes |
+|---|---|---|
+| `type` | string | `"image"` \| `"audio"` \| `"document"` |
+| `url` | string | a shim URL (`{WHATSAPP_GATEWAY_URL}/media/<token>`) the agent GETs to fetch the bytes |
+| `mime` | string? | MIME inferred from the file extension; absent when unknown |
+| `filename` | string? | original-ish filename; absent when unknown |
+
+A media caption, when present, is folded into `body` (so a captioned image arrives as both the
+caption text and a `media[0]`). The bytes are **never** inlined into this JSON.
+
+- **Fetching the bytes:** `GET {url}` with **`Authorization: Bearer <WHATSAPP_GATEWAY_TOKEN>`** (the
+  same bearer as `/send`). The shim verifies a stateless HMAC token over the GOWA-relative path and
+  proxy-streams the file from GOWA, forwarding GOWA's own `Content-Type`. The agent MUST present the
+  bearer (401 otherwise); a bad/garbage/tampered token is 403; an expired/cleaned file is 404.
+- **Lazy + ephemeral:** the URL is built at forward time and points at GOWA's `statics/media/` store,
+  which GOWA may clean. The agent SHOULD fetch promptly (e.g. as part of the turn) rather than
+  persisting the URL for later.
+- **Agent obligations:** the agent MUST fetch the bytes **server-side** and MUST NOT hand this
+  private, bearer-gated URL to a third party (e.g. OpenAI) — download, then pass the bytes/own copy.
+- **Limitation:** if GOWA runs with `WHATSAPP_AUTO_DOWNLOAD_MEDIA=false`, inbound media arrives as a
+  CDN URL needing media keys the shim doesn't have; such items are skipped (logged) and won't appear
+  in `media`. The default is auto-download **on**.
 - **Response:** any **2xx** = accepted. The shim treats non-2xx, a connection failure, or **no
   response within its 120 s forward timeout** as a failure → it retries with exponential backoff and
   then dead-letters. **The forward is at-least-once** (see idempotency requirement R2c).
@@ -65,6 +94,24 @@ endpoint and `spike-rust-agent.exe.xyz` 404 on `/whatsapp/inbound`.
 - **Shim responses:** `200 {"sent":true,"id":"<gowa-msg-id>"}`; `401` bad bearer; `400` missing
   `to`/`text`; `429` rate-limited (`WA_SEND_RATE_PER_MIN`). The agent SHOULD treat `429`/`5xx` as
   retryable with backoff and SHOULD NOT spin.
+
+### Outbound media — `POST {WHATSAPP_GATEWAY_URL}/send/{image,audio,file}` (agent → shim)
+
+Send an image, audio/voice-note, or arbitrary file back out. Same bearer as `/send`
+(`Authorization: Bearer <WHATSAPP_GATEWAY_TOKEN>`), and **rate-limited** — a media send spends the
+`WA_SEND_RATE_PER_MIN` budget (unlike chat-presence).
+
+- **Body:** `{ "chat_id": <JID>, "to": <same JID>, "media_url": <url?>, "media_base64": <b64?>, "caption": <text?>, "filename": <name?>, "mime": <type?>, "reply_to": <id?>, "voice": <bool?> }`.
+  - Provide **exactly one** of `media_url` (a publicly-reachable URL GOWA fetches itself) or
+    `media_base64` (the bytes, base64-standard, uploaded to GOWA as multipart). `media_url` wins if
+    both are present.
+  - `caption` applies to `image`/`file`; `voice: true` (alias `ptt`) sends `audio` as a push-to-talk
+    voice note; `filename`/`mime` describe a `media_base64` upload (defaults applied otherwise);
+    `reply_to` quotes a message on any kind.
+  - **MUST echo `chat_id` verbatim**, exactly as for `/send`.
+- **Shim responses:** `200 {"sent":true,"id":"<gowa-msg-id>"}`; `401` bad bearer; `400` missing
+  destination or neither media field (or undecodable base64); `429` rate-limited; `400`/`502` map
+  GOWA's 4xx/5xx as for `/send`.
 
 ### Chat presence (typing indicator) — `POST {WHATSAPP_GATEWAY_URL}/send/chat-presence` (agent → shim)
 

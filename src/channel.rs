@@ -54,11 +54,15 @@ impl ChannelRouter {
     pub fn from_config(config: &Config) -> Result<Self, DynError> {
         let mut clients = HashMap::with_capacity(config.channels.len());
         for channel in &config.channels {
+            // `media_base` + the media signing key are shim-wide (not per-channel), so every channel
+            // client builds the same `/media` URLs.
             let client = AgentClient::with_endpoint(
                 channel.inbound_url.clone(),
                 channel.health_url.clone(),
                 channel.bearer.clone(),
                 config.agent_debug_sink,
+                config.media_base_url.clone(),
+                config.gowa_webhook_secret.clone(),
             )?;
             clients.insert(channel.label.clone(), client);
         }
@@ -115,6 +119,8 @@ mod tests {
                 "http://127.0.0.1:3001/health".to_string(),
                 "bearer".to_string(),
                 false,
+                "http://127.0.0.1:8080".to_string(),
+                "media-key".to_string(),
             )
             .unwrap()
         };
@@ -139,6 +145,7 @@ mod tests {
             reply_to: None,
             quoted_body: None,
             channel: DEFAULT_CHANNEL.into(),
+            media: vec![],
         }
     }
 

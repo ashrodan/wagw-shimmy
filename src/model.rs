@@ -48,6 +48,55 @@ pub struct GowaPayload {
     /// so a "reply + @tag" carries the question being replied to, not just the bare mention.
     #[serde(default)]
     pub quoted_body: Option<String>,
+    /// Inbound media attachments. GOWA's auto-download (`WHATSAPP_AUTO_DOWNLOAD_MEDIA=true`, the
+    /// default) writes each to `statics/media/<file>` and reports it here. Polymorphic: a bare path
+    /// string (`"image":"statics/media/x.jpg"`) or an object (`{"path":…,"caption":…}`); with
+    /// auto-download off it's instead `{"url":"https://mmg.whatsapp.net/…"}` (a CDN URL needing
+    /// media keys we don't have — skipped, see [`GowaEnvelope::into_inbound`]).
+    #[serde(default)]
+    pub image: Option<GowaMedia>,
+    #[serde(default)]
+    pub audio: Option<GowaMedia>,
+    #[serde(default)]
+    pub document: Option<GowaMedia>,
+}
+
+/// A GOWA inbound media field, in either shape GOWA emits. Untagged so serde tries each variant by
+/// structure: a JSON string → [`GowaMedia::Path`]; a JSON object → [`GowaMedia::Object`].
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum GowaMedia {
+    /// Bare local path form: `"image": "statics/media/x.jpg"` (no caption).
+    Path(String),
+    /// Object form: `"image": {"path": …, "caption": …}` (auto-download on) or
+    /// `{"url": "https://mmg.whatsapp.net/…"}` (auto-download off — no local path).
+    Object {
+        #[serde(default)]
+        path: Option<String>,
+        #[serde(default)]
+        url: Option<String>,
+        #[serde(default)]
+        caption: Option<String>,
+    },
+}
+
+/// One inbound media attachment, internal to the shim and persisted on [`Inbound`]. Carries only the
+/// GOWA-relative path (tiny) — never the bytes; the forward builds a signed `/media` URL from it at
+/// forward time (see [`crate::agent`]). Derives `Serialize`/`Deserialize` so it survives the durable
+/// queue and a restart, exactly like the rest of [`Inbound`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MediaItem {
+    /// `"image"` | `"audio"` | `"document"` — the forwarded `type`.
+    pub kind: String,
+    /// GOWA-relative path under `statics/media/`, e.g. `statics/media/abc123.jpg`.
+    pub gowa_path: String,
+    /// MIME type inferred from the path extension; `None` when unknown (the proxy still streams it
+    /// with GOWA's own `Content-Type`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mime: Option<String>,
+    /// Final path component, e.g. `abc123.jpg`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filename: Option<String>,
 }
 
 /// Why an inbound message was not forwarded. Returned by [`GowaEnvelope::into_inbound`] for the
@@ -92,6 +141,11 @@ pub struct Inbound {
     /// (it falls back to `"default"`, i.e. today's behaviour) instead of dead-lettering.
     #[serde(default = "default_channel_label")]
     pub channel: String,
+    /// Inbound media attachments (image/audio/document). Empty for a text-only message.
+    /// `#[serde(default)]` so a pending file written before this field existed still loads (as an
+    /// empty vec), exactly like the `channel`/`quoted_body` precedent.
+    #[serde(default)]
+    pub media: Vec<MediaItem>,
 }
 
 /// The default value for [`Inbound::channel`]: the always-present default channel label.
@@ -151,18 +205,116 @@ impl GowaEnvelope {
         // sender *is* the chat. Fall back so DM allowlisting always has a JID to match.
         let sender = non_empty(payload.from).unwrap_or_else(|| chat_id.clone());
 
+        // Collect present media, accumulating any media-object captions to fold into an empty body.
+        let mut media = Vec::new();
+        let mut captions: Vec<String> = Vec::new();
+        for (kind, field) in [
+            ("image", payload.image),
+            ("audio", payload.audio),
+            ("document", payload.document),
+        ] {
+            if let Some((item, caption)) = extract_media(kind, field) {
+                if let Some(caption) = caption {
+                    captions.push(caption);
+                }
+                media.push(item);
+            }
+        }
+
+        // GOWA usually puts a media caption in the top-level `body`; fold the media-object caption in
+        // only when `body` is empty so we never double it.
+        let mut body = payload.body.unwrap_or_default();
+        if body.trim().is_empty() && !captions.is_empty() {
+            body = captions.join("\n");
+        }
+
         Ok(Inbound {
             chat_id,
             sender,
-            body: payload.body.unwrap_or_default(),
+            body,
             id,
             is_from_me: false,
             mentioned: false,
             reply_to: non_empty(payload.replied_to_id),
             quoted_body: non_empty(payload.quoted_body),
             channel: default_channel_label(),
+            media,
         })
     }
+}
+
+/// Turn one GOWA media field into a [`MediaItem`] plus its caption (if the object form carried one).
+/// Returns `None` when the field is absent or carries only a CDN `url` (auto-download off) — that
+/// form needs media keys the shim doesn't have, so it's a documented limitation, logged and skipped.
+fn extract_media(kind: &str, field: Option<GowaMedia>) -> Option<(MediaItem, Option<String>)> {
+    let (path, caption) = match field? {
+        GowaMedia::Path(path) => (non_empty(Some(path)), None),
+        GowaMedia::Object { path, url, caption } => {
+            let path = non_empty(path);
+            if path.is_none() && non_empty(url).is_some() {
+                tracing::warn!(
+                    media_kind = %kind,
+                    "inbound media carries only a CDN url (auto-download off); skipping"
+                );
+            }
+            (path, non_empty(caption))
+        }
+    };
+    // Normalise a leading slash off so the path matches the `statics/media/` prefix the proxy checks.
+    let path = path?.trim_start_matches('/').to_string();
+    let (mime, filename) = infer_mime_and_filename(&path);
+    Some((
+        MediaItem {
+            kind: kind.to_string(),
+            gowa_path: path,
+            mime,
+            filename,
+        },
+        caption,
+    ))
+}
+
+/// Infer `(mime, filename)` from a GOWA media path by its extension. Best-effort: an unknown
+/// extension yields `None` mime (the `/media` proxy still streams it with GOWA's own `Content-Type`).
+fn infer_mime_and_filename(path: &str) -> (Option<String>, Option<String>) {
+    let filename = path
+        .rsplit('/')
+        .next()
+        .filter(|name| !name.is_empty())
+        .map(str::to_string);
+    let mime = filename
+        .as_deref()
+        .and_then(|name| name.rsplit_once('.'))
+        .and_then(|(_, ext)| mime_for_extension(&ext.to_ascii_lowercase()))
+        .map(str::to_string);
+    (mime, filename)
+}
+
+/// Map a lowercase file extension to a MIME type for the common image/audio/document kinds GOWA
+/// auto-downloads. Anything unrecognised returns `None`.
+fn mime_for_extension(ext: &str) -> Option<&'static str> {
+    Some(match ext {
+        "jpg" | "jpeg" => "image/jpeg",
+        "png" => "image/png",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "ogg" | "oga" => "audio/ogg",
+        "mp3" => "audio/mpeg",
+        "m4a" => "audio/mp4",
+        "aac" => "audio/aac",
+        "wav" => "audio/wav",
+        "pdf" => "application/pdf",
+        "doc" => "application/msword",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "xls" => "application/vnd.ms-excel",
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "ppt" => "application/vnd.ms-powerpoint",
+        "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "txt" => "text/plain",
+        "csv" => "text/csv",
+        "zip" => "application/zip",
+        _ => return None,
+    })
 }
 
 /// Status broadcasts and newsletters are not conversational and must never be answered.
@@ -305,6 +457,86 @@ mod tests {
             env.into_inbound().unwrap_err(),
             DropReason::NotAMessageEvent
         );
+    }
+
+    #[test]
+    fn parses_image_object_form_and_folds_caption_into_empty_body() {
+        // Object form with a caption and an empty top-level body → caption becomes the body.
+        let env = parse(
+            r#"{"event":"message","payload":{
+                "chat_id":"61400111222@s.whatsapp.net","id":"m","body":"",
+                "image":{"path":"statics/media/abc123.jpg","caption":"check this out"}}}"#,
+        );
+        let inbound = env.into_inbound().unwrap();
+        assert_eq!(inbound.media.len(), 1);
+        assert_eq!(inbound.media[0].kind, "image");
+        assert_eq!(inbound.media[0].gowa_path, "statics/media/abc123.jpg");
+        assert_eq!(inbound.media[0].mime.as_deref(), Some("image/jpeg"));
+        assert_eq!(inbound.media[0].filename.as_deref(), Some("abc123.jpg"));
+        assert_eq!(inbound.body, "check this out");
+    }
+
+    #[test]
+    fn parses_image_string_form_without_caption() {
+        let env = parse(
+            r#"{"event":"message","payload":{
+                "chat_id":"61400111222@s.whatsapp.net","id":"m",
+                "image":"statics/media/photo.png"}}"#,
+        );
+        let inbound = env.into_inbound().unwrap();
+        assert_eq!(inbound.media.len(), 1);
+        assert_eq!(inbound.media[0].gowa_path, "statics/media/photo.png");
+        assert_eq!(inbound.media[0].mime.as_deref(), Some("image/png"));
+        assert!(inbound.body.is_empty());
+    }
+
+    #[test]
+    fn parses_audio_voice_note() {
+        let env = parse(
+            r#"{"event":"message","payload":{
+                "chat_id":"61400111222@s.whatsapp.net","id":"m",
+                "audio":"statics/media/voice.ogg"}}"#,
+        );
+        let inbound = env.into_inbound().unwrap();
+        assert_eq!(inbound.media.len(), 1);
+        assert_eq!(inbound.media[0].kind, "audio");
+        assert_eq!(inbound.media[0].mime.as_deref(), Some("audio/ogg"));
+    }
+
+    #[test]
+    fn parses_document_and_keeps_existing_body() {
+        // A non-empty body is kept; the document still attaches.
+        let env = parse(
+            r#"{"event":"message","payload":{
+                "chat_id":"61400111222@s.whatsapp.net","id":"m","body":"the report",
+                "document":{"path":"statics/media/report.pdf"}}}"#,
+        );
+        let inbound = env.into_inbound().unwrap();
+        assert_eq!(inbound.media.len(), 1);
+        assert_eq!(inbound.media[0].kind, "document");
+        assert_eq!(inbound.media[0].mime.as_deref(), Some("application/pdf"));
+        assert_eq!(inbound.body, "the report");
+    }
+
+    #[test]
+    fn skips_cdn_url_only_media_when_auto_download_off() {
+        // Auto-download off → object carries only a CDN url, no local path → skipped entirely.
+        let env = parse(
+            r#"{"event":"message","payload":{
+                "chat_id":"61400111222@s.whatsapp.net","id":"m",
+                "image":{"url":"https://mmg.whatsapp.net/d/f/xyz.enc"}}}"#,
+        );
+        let inbound = env.into_inbound().unwrap();
+        assert!(inbound.media.is_empty());
+    }
+
+    #[test]
+    fn text_only_message_has_no_media() {
+        let env = parse(
+            r#"{"event":"message","payload":{
+                "chat_id":"61400111222@s.whatsapp.net","id":"m","body":"hi"}}"#,
+        );
+        assert!(env.into_inbound().unwrap().media.is_empty());
     }
 
     #[test]

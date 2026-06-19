@@ -8,17 +8,23 @@
 //! - `POST /send/chat-presence` — typing indicator: bearer-verify → GOWA `/send/chat-presence`.
 //!   Deliberately *not* rate-limited (it is not a message send, so it must not spend the
 //!   `WA_SEND_RATE_PER_MIN` budget) and best-effort from the agent's side.
+//! - `POST /send/{image,audio,file}` — outbound media: bearer-verify → rate-limit → GOWA
+//!   `/send/{image,audio,file}` (a `media_url` GOWA fetches, or in-band `media_base64` uploaded as
+//!   multipart). Records the returned id like `/send`.
+//! - `GET /media/{token}` — inbound media proxy: bearer-verify → verify the stateless media token →
+//!   proxy-stream the GOWA static file it authorises (the URL the agent receives inbound).
 //! - `GET /livez`        — process liveness (static); `/healthz` is an alias.
 //! - `GET /readyz`       — dependency-aware readiness (probes GOWA, optionally the agent).
 
 use axum::{
     Json, Router,
-    body::Bytes,
-    extract::{DefaultBodyLimit, State},
-    http::{HeaderMap, StatusCode},
+    body::{Body, Bytes},
+    extract::{DefaultBodyLimit, Path, State},
+    http::{HeaderMap, StatusCode, header::CONTENT_TYPE},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -30,7 +36,7 @@ use crate::{
     dedup::TtlSet,
     error::{DynError, HttpError},
     forward::{ForwardQueue, ForwardWorker, WorkerConfig},
-    gowa::{GowaClient, verify_signature},
+    gowa::{GowaClient, MediaSource, SendMediaOpts, verify_signature},
     model::GowaEnvelope,
     policy,
     ratelimit::SendLimiter,
@@ -94,17 +100,30 @@ impl AppState {
 /// peer (a compromised GOWA, or anything that reached loopback) could force us to buffer.
 const MAX_BODY_BYTES: usize = 256 * 1024;
 
-/// Assemble the router. Exposed so integration tests can drive it without binding a socket.
+/// Higher body cap for the media-upload routes (`/send/{image,audio,file}` with `media_base64`): a
+/// base64 image/voice-note/document must fit, but the global 256 KiB cap stays for everything else.
+const MAX_MEDIA_BODY_BYTES: usize = 16 * 1024 * 1024;
+
+/// Assemble the router. Exposed so integration tests can drive it without binding a socket. The
+/// media-upload routes carry their own larger body limit; every other route keeps the 256 KiB cap.
 pub fn build_router(state: AppState) -> Router {
-    Router::new()
+    let standard = Router::new()
         .route("/livez", get(livez))
         .route("/healthz", get(livez)) // alias kept for existing scripts/docs
         .route("/readyz", get(readyz))
         .route("/webhook/gowa", post(webhook_gowa))
         .route("/send", post(send))
         .route("/send/chat-presence", post(send_chat_presence))
-        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
-        .with_state(state)
+        .route("/media/{token}", get(media))
+        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES));
+
+    let media_uploads = Router::new()
+        .route("/send/image", post(send_image))
+        .route("/send/audio", post(send_audio))
+        .route("/send/file", post(send_file))
+        .layer(DefaultBodyLimit::max(MAX_MEDIA_BODY_BYTES));
+
+    standard.merge(media_uploads).with_state(state)
 }
 
 /// Process-only liveness: the binary is up and serving. Says nothing about dependencies.
@@ -319,6 +338,184 @@ async fn send_chat_presence(
             tracing::warn!(phone = %phone, action, %error, "chat-presence forward to GOWA failed");
             Err(error)
         }
+    }
+}
+
+/// The inbound media proxy. `GET /media/{token}` (bearer-gated, same token as `/send`) verifies the
+/// stateless media token, then proxy-streams the GOWA static file it authorises. The token is an
+/// HMAC over the GOWA-relative path (see [`crate::media`]), so a bad/garbage token is a 403 and the
+/// proxy can never be steered outside `statics/media/`. A GOWA 404 (file expired/cleaned) is
+/// forwarded as a 404; a GOWA transport failure surfaces as the usual upstream error.
+async fn media(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(token): Path<String>,
+) -> Response {
+    if !bearer_matches(&headers, &state.config.whatsapp_gateway_token) {
+        return HttpError::Unauthorized.into_response();
+    }
+    let Some(path) = crate::media::verify(state.config.gowa_webhook_secret.as_bytes(), &token)
+    else {
+        tracing::warn!("rejected /media request: bad or unverifiable token");
+        return StatusCode::FORBIDDEN.into_response();
+    };
+
+    match state.gowa.fetch_static(&path).await {
+        Ok(fetched) => {
+            let mut response = Response::new(Body::from(fetched.body));
+            *response.status_mut() = fetched.status;
+            if let Some(content_type) = fetched.content_type
+                && let Ok(value) = content_type.parse()
+            {
+                response.headers_mut().insert(CONTENT_TYPE, value);
+            }
+            response
+        }
+        Err(error) => error.into_response(),
+    }
+}
+
+/// The three outbound media kinds, each mapping to a GOWA `/send/{kind}` endpoint.
+#[derive(Clone, Copy)]
+enum MediaKind {
+    Image,
+    Audio,
+    File,
+}
+
+async fn send_image(
+    state: State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<Value>, HttpError> {
+    send_media(state, headers, body, MediaKind::Image).await
+}
+
+async fn send_audio(
+    state: State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<Value>, HttpError> {
+    send_media(state, headers, body, MediaKind::Audio).await
+}
+
+async fn send_file(
+    state: State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<Value>, HttpError> {
+    send_media(state, headers, body, MediaKind::File).await
+}
+
+/// Shared outbound media handler. `{to|chat_id, media_url|media_base64, caption?, filename?,
+/// reply_to?, voice?}` → the matching `GowaClient` send. Like `/send`: bearer-checked, then
+/// **rate-limited** (a media send spends the `WA_SEND_RATE_PER_MIN` budget, unlike presence), and the
+/// returned id is recorded for reply-to-bot detection. `media_url` (GOWA fetches it) wins over
+/// `media_base64` (uploaded as multipart).
+async fn send_media(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+    kind: MediaKind,
+) -> Result<Json<Value>, HttpError> {
+    if !bearer_matches(&headers, &state.config.whatsapp_gateway_token) {
+        return Err(HttpError::Unauthorized);
+    }
+
+    let request: SendMediaRequest = serde_json::from_slice(&body)
+        .map_err(|error| HttpError::BadRequest(format!("invalid media send body: {error}")))?;
+    let to = request
+        .destination()
+        .ok_or_else(|| HttpError::BadRequest("missing 'to'/'chat_id'".into()))?
+        .to_string();
+
+    // Build the source: a URL GOWA fetches, or in-band base64 bytes we upload as multipart.
+    let source = if let Some(url) = first_non_empty([request.media_url.as_deref()]) {
+        MediaSource::Url(url.to_string())
+    } else if let Some(encoded) = first_non_empty([request.media_base64.as_deref()]) {
+        let data = STANDARD
+            .decode(encoded)
+            .map_err(|error| HttpError::BadRequest(format!("invalid media_base64: {error}")))?;
+        let filename = first_non_empty([request.filename.as_deref()])
+            .map(str::to_string)
+            .unwrap_or_else(|| default_filename(kind));
+        MediaSource::Bytes {
+            data,
+            filename,
+            mime: first_non_empty([request.mime.as_deref()]).map(str::to_string),
+        }
+    } else {
+        return Err(HttpError::BadRequest(
+            "missing 'media_url'/'media_base64'".into(),
+        ));
+    };
+
+    // A media send is a real send → it spends the outbound budget (unlike chat-presence).
+    if !state.limiter.try_acquire() {
+        tracing::warn!(to = %to, "outbound media send rate-limited");
+        return Err(HttpError::RateLimited);
+    }
+
+    let opts = SendMediaOpts {
+        caption: first_non_empty([request.caption.as_deref()]).map(str::to_string),
+        reply_to: first_non_empty([request.reply_to.as_deref()]).map(str::to_string),
+        // `voice` (or its `ptt` alias) only affects audio; image/file ignore it.
+        voice: request.voice || request.ptt,
+    };
+
+    let message_id = match kind {
+        MediaKind::Image => state.gowa.send_image(&to, source, opts).await?,
+        MediaKind::Audio => state.gowa.send_audio(&to, source, opts).await?,
+        MediaKind::File => state.gowa.send_file(&to, source, opts).await?,
+    };
+
+    if !message_id.is_empty() {
+        state.sent_ids.record(&message_id);
+    }
+    Ok(Json(json!({ "sent": true, "id": message_id })))
+}
+
+/// A fallback multipart filename for a base64 upload with no `filename` given.
+fn default_filename(kind: MediaKind) -> String {
+    match kind {
+        MediaKind::Image => "image.jpg",
+        MediaKind::Audio => "audio.ogg",
+        MediaKind::File => "file.bin",
+    }
+    .to_string()
+}
+
+/// The agent's media-send body. Destination is coalesced like `/send` (`to|chat_id`); the bytes are
+/// either a `media_url` GOWA fetches or an in-band `media_base64`. `voice`/`ptt` (audio voice note)
+/// are accepted as aliases.
+#[derive(Deserialize)]
+struct SendMediaRequest {
+    #[serde(default)]
+    to: Option<String>,
+    #[serde(default)]
+    chat_id: Option<String>,
+    #[serde(default)]
+    media_url: Option<String>,
+    #[serde(default)]
+    media_base64: Option<String>,
+    #[serde(default)]
+    caption: Option<String>,
+    #[serde(default)]
+    filename: Option<String>,
+    #[serde(default)]
+    mime: Option<String>,
+    #[serde(default)]
+    reply_to: Option<String>,
+    #[serde(default)]
+    voice: bool,
+    #[serde(default)]
+    ptt: bool,
+}
+
+impl SendMediaRequest {
+    /// Destination JID — `to` wins, then `chat_id`; trimmed, empty treated as absent.
+    fn destination(&self) -> Option<&str> {
+        first_non_empty([self.to.as_deref(), self.chat_id.as_deref()])
     }
 }
 

@@ -22,6 +22,7 @@ pub mod dedup;
 pub mod error;
 pub mod forward;
 pub mod gowa;
+pub mod media;
 pub mod model;
 pub mod policy;
 pub mod ratelimit;

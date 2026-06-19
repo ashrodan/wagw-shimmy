@@ -359,6 +359,7 @@ mod tests {
             reply_to: None,
             quoted_body: None,
             channel: "default".into(),
+            media: vec![],
         }
     }
 

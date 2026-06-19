@@ -1,0 +1,17 @@
+{
+  "event": "message",
+  "device_id": "61400000000@s.whatsapp.net",
+  "payload": {
+    "id": "MSG_IMG_1",
+    "chat_id": "61400111222@s.whatsapp.net",
+    "from": "61400111222@s.whatsapp.net",
+    "from_name": "Jane Doe",
+    "timestamp": "2026-06-13T10:40:00Z",
+    "is_from_me": false,
+    "body": "",
+    "image": {
+      "path": "statics/media/abc123.jpg",
+      "caption": "check this out"
+    }
+  }
+}
