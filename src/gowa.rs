@@ -362,6 +362,64 @@ impl GowaClient {
             )))
         }
     }
+
+    /// React to a message with `emoji` (or *remove* the bot's reaction when `emoji` is empty). Maps
+    /// to GOWA `POST /message/{message_id}/reaction {phone, emoji}`. Unlike the `/send/*` family the
+    /// message id is a URL *path* segment, so the URL is built per call (and the segment is
+    /// percent-encoded for safety). Same `X-Device-Id` + basic auth as the other sends; error
+    /// classification mirrors [`Self::send_message`] (4xx ⇒ `BadRequest`, 5xx/429/transport ⇒
+    /// `Upstream`). A reaction creates no new addressable message, so nothing is recorded for
+    /// reply-to-bot detection — hence the `()` return.
+    pub async fn send_reaction(
+        &self,
+        chat_id: &str,
+        message_id: &str,
+        emoji: &str,
+    ) -> Result<(), HttpError> {
+        let url = format!(
+            "{}/message/{}/reaction",
+            self.statics_base,
+            encode_path_segment(message_id)
+        );
+        let body = json!({ "phone": chat_id, "emoji": emoji });
+
+        let mut request = self
+            .http
+            .post(&url)
+            .header("X-Device-Id", &self.device_id)
+            .json(&body);
+        if let Some(auth) = &self.basic_auth {
+            request = request.basic_auth(&auth.user, Some(&auth.pass));
+        }
+
+        let response = request.send().await.map_err(|error| {
+            HttpError::Upstream(format!(
+                "GOWA reaction request failed: {}",
+                classify(&error)
+            ))
+        })?;
+        let status = response.status();
+        let raw = response.text().await.unwrap_or_default();
+        // GOWA echoes a message id we don't need (a reaction isn't a fresh addressable message).
+        classify_send(status, &raw, "reaction").map(|_| ())
+    }
+}
+
+/// Percent-encode a value for use as a single URL path segment. GOWA takes the message id as a path
+/// parameter (`/message/{id}/reaction`); WhatsApp ids are usually `[A-F0-9]`/base64-ish, but a stray
+/// `/`, `+`, `=`, or space would corrupt the path, so anything outside the RFC 3986 unreserved set
+/// is escaped.
+fn encode_path_segment(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(byte as char);
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
 }
 
 #[derive(Serialize)]

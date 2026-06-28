@@ -43,6 +43,7 @@ Envelope: `{ "event": "...", "device_id": "...", "payload": { … } }`. Fields t
 | `is_from_me`    | `true` → the bot's own echo; dropped.                                    |
 | `replied_to_id` | id of the quoted message → powers reply-to-bot mention detection.        |
 | `image`/`audio`/`document` | media attachment (string path or `{path,caption}` object) → forwarded as `media[]`. |
+| `reaction`/`reacted_message_id` | on a `message.reaction` event: the emoji + the id it reacts to → forwarded as a `type:"reaction"` inbound. |
 
 `status@broadcast` and `…@newsletter` chats are dropped. Deserialisation is lenient (all fields
 optional, unknowns ignored) so a payload-shape drift degrades to a dropped message, not a 500.
@@ -65,7 +66,7 @@ sequenceDiagram
     participant Agent
     GOWA->>Shim: POST /webhook/gowa  (X-Hub-Signature-256)
     Note over Shim: verify HMAC over raw bytes → 401 on mismatch
-    Note over Shim: drop if event≠message / is_from_me / status / newsletter
+    Note over Shim: drop if event∉{message,message.reaction} / is_from_me / status / newsletter
     Note over Shim: mentioned = replied_to_id ∈ recent sent ids
     Note over Shim: dedup on id (GOWA re-delivers)
     Note over Shim: policy: dm/group allowlist + require-mention
@@ -124,6 +125,16 @@ the shim re-serves them.
   `{kind}_url` (GOWA fetches it); `media_base64` → a multipart upload to GOWA. `voice:true` sends
   audio as a push-to-talk voice note.
 
+## Reactions (emoji)
+
+Both directions. **Inbound:** a GOWA `message.reaction` event is forwarded to the agent as a
+`type:"reaction"` inbound carrying `{reaction, reacted_message_id}` (empty `reaction` = the user
+removed it). Requires `WHATSAPP_WEBHOOK_EVENTS` to include `message.reaction`. A reaction to one of
+the bot's own recent messages counts as a mention (so it isn't dropped in a require-mention group).
+**Outbound:** `POST /send/reaction` with `{to|chat_id, message_id, emoji}` (bearer + rate-limited,
+like `/send`) → GOWA `POST /message/{message_id}/reaction`. An empty/absent `emoji` removes the bot's
+reaction. Full shape in [`docs/AGENT-WHATSAPP-CONTRACT.md`](docs/AGENT-WHATSAPP-CONTRACT.md).
+
 `SHIM_MEDIA_BASE_URL` (default `http://{SHIM_BIND}`) must equal the agent's `WHATSAPP_GATEWAY_URL`.
 Auto-download-off (CDN-URL inbound) and video/sticker are out of scope; see [`docs/HARDENING.md`](docs/HARDENING.md).
 Full normative shape in [`docs/AGENT-WHATSAPP-CONTRACT.md`](docs/AGENT-WHATSAPP-CONTRACT.md).
@@ -134,14 +145,18 @@ See [`.env.example`](.env.example) for the full list. Boot is fail-fast: a missi
 or unknown policy enum aborts startup. Error messages name the offending *variable*, never its value.
 
 GOWA-side settings (set on GOWA, not the shim): webhook URL → `http://127.0.0.1:8080/webhook/gowa`,
-`WHATSAPP_WEBHOOK_EVENTS=message` (filter at source), `WHATSAPP_WEBHOOK_SECRET=<GOWA_WEBHOOK_SECRET>`.
-The agent's `WHATSAPP_GATEWAY_URL` points at the shim (`http://127.0.0.1:8080`).
+`WHATSAPP_WEBHOOK_EVENTS=message,message.reaction` (filter at source — `message.reaction` enables
+inbound emoji reactions), `WHATSAPP_AUTO_DOWNLOAD_MEDIA=true` (**required** for inbound media: GOWA
+must write the file to its local `statics/media/` store for the `/media` proxy to re-serve it — with
+it off, images/attachments arrive as CDN URLs the shim can't decrypt and are silently dropped),
+`WHATSAPP_WEBHOOK_SECRET=<GOWA_WEBHOOK_SECRET>`. The agent's `WHATSAPP_GATEWAY_URL` points at the
+shim (`http://127.0.0.1:8080`).
 
 ## Build, test, lint
 
 ```sh
 cargo build
-cargo test                  # 60 unit + 29 e2e; no network, no WA account, no API spend
+cargo test                  # 64 unit + 36 e2e; no network, no WA account, no API spend
 cargo clippy --all-targets  # CI-equivalent gate — keep clean
 ```
 

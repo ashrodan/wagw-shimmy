@@ -113,6 +113,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/readyz", get(readyz))
         .route("/webhook/gowa", post(webhook_gowa))
         .route("/send", post(send))
+        .route("/send/reaction", post(send_reaction))
         .route("/send/chat-presence", post(send_chat_presence))
         .route("/media/{token}", get(media))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES));
@@ -207,7 +208,14 @@ async fn webhook_gowa(State(state): State<AppState>, headers: HeaderMap, body: B
         .self_number
         .as_deref()
         .is_some_and(|number| crate::model::body_mentions_number(&inbound.body, number));
-    inbound.mentioned = tagged || state.sent_ids.is_reply_to_bot(inbound.reply_to.as_deref());
+    // A reply *or* a reaction that references one of the bot's own recently-sent ids counts as
+    // addressing the bot — so a reaction to the bot's message in a require-mention group isn't
+    // dropped by policy. `reacted_message_id` is `None` for a normal message, so this is a no-op there.
+    inbound.mentioned = tagged
+        || state.sent_ids.is_reply_to_bot(inbound.reply_to.as_deref())
+        || state
+            .sent_ids
+            .is_reply_to_bot(inbound.reacted_message_id.as_deref());
 
     // Addressing verdict for a group message (debug only; booleans, never message content): why it
     // was or wasn't summoned. `@`-tag and reply-quote carry were both confirmed live on wagw-1.
@@ -299,6 +307,44 @@ async fn send(
     }
 
     Ok(Json(json!({ "sent": true, "id": message_id })))
+}
+
+/// The agent's emoji reaction. `{to|chat_id, message_id, emoji}` → GOWA
+/// `POST /message/{message_id}/reaction`. Same bearer as `/send` and, like a media send, it spends
+/// the outbound rate-limit budget (a reaction is a visible WhatsApp action, ToS-relevant). An
+/// empty/absent `emoji` removes the bot's previous reaction (GOWA treats empty as un-react). No id is
+/// recorded for reply-to-bot detection — a reaction is not a message the agent gets replied to.
+async fn send_reaction(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<Value>, HttpError> {
+    // 1. Bearer the agent must present.
+    if !bearer_matches(&headers, &state.config.whatsapp_gateway_token) {
+        return Err(HttpError::Unauthorized);
+    }
+
+    // 2. Parse after auth so unauthenticated callers learn nothing about the body shape.
+    let request: ReactionRequest = serde_json::from_slice(&body)
+        .map_err(|error| HttpError::BadRequest(format!("invalid reaction body: {error}")))?;
+    let to = request
+        .destination()
+        .ok_or_else(|| HttpError::BadRequest("missing 'to'/'chat_id'".into()))?;
+    let message_id = request
+        .target()
+        .ok_or_else(|| HttpError::BadRequest("missing 'message_id'".into()))?;
+    // Empty emoji is valid — it removes the bot's reaction. Trim surrounding whitespace only.
+    let emoji = request.emoji.as_deref().unwrap_or_default().trim();
+
+    // 3. Per-tenant outbound rate limit — a reaction spends the send budget (unlike chat-presence).
+    if !state.limiter.try_acquire() {
+        tracing::warn!(to = %to, "outbound reaction rate-limited");
+        return Err(HttpError::RateLimited);
+    }
+
+    // 4. React. `to` carries the JID, so DM vs group is implicit (a group reaction lands in the group).
+    state.gowa.send_reaction(to, message_id, emoji).await?;
+    Ok(Json(json!({ "reacted": true })))
 }
 
 /// The agent's typing indicator. `{phone|chat_id, action}` → GOWA `/send/chat-presence`. Same bearer
@@ -516,6 +562,32 @@ impl SendMediaRequest {
     /// Destination JID — `to` wins, then `chat_id`; trimmed, empty treated as absent.
     fn destination(&self) -> Option<&str> {
         first_non_empty([self.to.as_deref(), self.chat_id.as_deref()])
+    }
+}
+
+/// The agent's reaction body. Destination is coalesced like `/send` (`to|chat_id`); `message_id` is
+/// the message to react to; `emoji` is the reaction (empty/absent removes the bot's reaction).
+#[derive(Deserialize)]
+struct ReactionRequest {
+    #[serde(default)]
+    to: Option<String>,
+    #[serde(default)]
+    chat_id: Option<String>,
+    #[serde(default)]
+    message_id: Option<String>,
+    #[serde(default)]
+    emoji: Option<String>,
+}
+
+impl ReactionRequest {
+    /// Destination JID — `to` wins, then `chat_id`; trimmed, empty treated as absent.
+    fn destination(&self) -> Option<&str> {
+        first_non_empty([self.to.as_deref(), self.chat_id.as_deref()])
+    }
+
+    /// The id of the message to react to; trimmed, empty treated as absent.
+    fn target(&self) -> Option<&str> {
+        first_non_empty([self.message_id.as_deref()])
     }
 }
 

@@ -27,8 +27,18 @@ struct InboundForward<'a> {
     id: &'a str,
     from_me: bool,
     channel: &'a str,
+    /// Message kind discriminator. Omitted entirely for a normal text/media message (so today's
+    /// forwards stay byte-identical), set to `"reaction"` for an emoji reaction.
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    kind: Option<&'a str>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     media: Vec<ForwardMedia>,
+    /// The emoji, on a reaction (`""` means the sender removed their reaction). Omitted otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reaction: Option<&'a str>,
+    /// The id of the message a reaction targets. Omitted otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reacted_message_id: Option<&'a str>,
 }
 
 /// One media attachment as the agent sees it: a `type`, a fetchable `url` (back at the shim's
@@ -158,6 +168,16 @@ impl AgentClient {
         // text is prepended so the agent sees what the user was replying to, not just a bare @tag.
         let agent_body = inbound.agent_body();
         let media = self.build_forward_media(inbound);
+        // A reaction forwards a `type:"reaction"` discriminator plus the emoji and target id; a
+        // normal message omits all three (the agent sees exactly today's shape).
+        let (kind, reaction, reacted_message_id) = match inbound.kind {
+            crate::model::InboundKind::Reaction => (
+                Some("reaction"),
+                inbound.reaction.as_deref(),
+                inbound.reacted_message_id.as_deref(),
+            ),
+            crate::model::InboundKind::Message => (None, None, None),
+        };
 
         // Debug sink: no agent target. Log the exact contract that *would* be forwarded and report
         // success so the durable queue drains cleanly (nothing dead-letters). Validates the
@@ -168,6 +188,7 @@ impl AgentClient {
                 id = %inbound.id,
                 from_me = inbound.is_from_me,
                 channel = %inbound.channel,
+                kind = kind.unwrap_or("message"),
                 media = media.len(),
                 body = %agent_body,
                 "DEBUG SINK: accepted inbound (no agent target) — would forward this contract"
@@ -181,7 +202,10 @@ impl AgentClient {
             id: &inbound.id,
             from_me: inbound.is_from_me,
             channel: &inbound.channel,
+            kind,
             media,
+            reaction,
+            reacted_message_id,
         };
 
         let response = self

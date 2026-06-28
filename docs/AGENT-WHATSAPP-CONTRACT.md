@@ -47,6 +47,7 @@ endpoint and `spike-rust-agent.exe.xyz` 404 on `/whatsapp/inbound`.
   | `from_me` | bool | always `false` in practice (shim drops own echoes); MUST be tolerated |
   | `channel` | string | per-group routing label (`"default"` or e.g. `"support"`). New, additive. |
   | `media` | array | media attachments (image/audio/document). Omitted entirely when none. New, additive. |
+  | `type` | string? | message-kind discriminator. **Omitted** for a normal text/media message; `"reaction"` for an emoji reaction (see below). New, additive. |
 
   The agent MUST ignore unknown fields (no `deny_unknown_fields`). Field aliases already accepted by
   the agent (`from`/`sender`, `message_id`, `text`/`message`) MAY remain but the shim only sends the
@@ -76,12 +77,33 @@ caption text and a `media[0]`). The bytes are **never** inlined into this JSON.
   persisting the URL for later.
 - **Agent obligations:** the agent MUST fetch the bytes **server-side** and MUST NOT hand this
   private, bearer-gated URL to a third party (e.g. OpenAI) — download, then pass the bytes/own copy.
-- **Limitation:** if GOWA runs with `WHATSAPP_AUTO_DOWNLOAD_MEDIA=false`, inbound media arrives as a
-  CDN URL needing media keys the shim doesn't have; such items are skipped (logged) and won't appear
-  in `media`. The default is auto-download **on**.
+- **Requires auto-download on:** GOWA MUST run with `WHATSAPP_AUTO_DOWNLOAD_MEDIA=true` (the fleet
+  default, set by `deploy/render-env.sh`) so it writes the file to its local `statics/media/` store
+  for the proxy to re-serve. With it **off**, inbound media arrives as an encrypted CDN URL needing
+  media keys the shim doesn't have; such items are skipped (logged) and won't appear in `media` — the
+  symptom is "images/attachments not reaching the agent".
 - **Response:** any **2xx** = accepted. The shim treats non-2xx, a connection failure, or **no
   response within its 120 s forward timeout** as a failure → it retries with exponential backoff and
   then dead-letters. **The forward is at-least-once** (see idempotency requirement R2c).
+
+#### Inbound reactions — `type: "reaction"` (shim → agent)
+
+When a WhatsApp user reacts to a message (the 👍 feature), the shim forwards a reaction event:
+
+| field | type | notes |
+|---|---|---|
+| `type` | string | `"reaction"` |
+| `chat_id` | string | conversation JID (the reply key, same as a message) |
+| `id` | string | the reaction event's own id (dedup key) |
+| `reaction` | string | the emoji; an **empty string** means the user *removed* their reaction |
+| `reacted_message_id` | string? | id of the message being reacted to |
+| `body` | string | empty for a reaction |
+
+- **Requires GOWA to forward it:** `WHATSAPP_WEBHOOK_EVENTS` MUST include `message.reaction` (the
+  fleet default is now `message,message.reaction`).
+- **Group policy:** in a require-mention group, a reaction to one of the bot's *own* recent messages
+  counts as addressing the bot (forwarded); other group reactions are dropped, like a plain group
+  message. DMs always forward (subject to the DM allowlist).
 
 ### Outbound — `POST {WHATSAPP_GATEWAY_URL}{SEND_PATH}` (agent → shim), default `/send`
 
@@ -112,6 +134,19 @@ Send an image, audio/voice-note, or arbitrary file back out. Same bearer as `/se
 - **Shim responses:** `200 {"sent":true,"id":"<gowa-msg-id>"}`; `401` bad bearer; `400` missing
   destination or neither media field (or undecodable base64); `429` rate-limited; `400`/`502` map
   GOWA's 4xx/5xx as for `/send`.
+
+### Outbound reaction — `POST {WHATSAPP_GATEWAY_URL}/send/reaction` (agent → shim)
+
+React to a message with an emoji, or remove the bot's reaction. Same bearer as `/send` and
+**rate-limited** — a reaction spends the `WA_SEND_RATE_PER_MIN` budget (it is a visible WhatsApp
+action), unlike chat-presence.
+
+- **Body:** `{ "chat_id": <JID>, "to": <same JID>, "message_id": <id>, "emoji": <emoji> }`. The shim
+  coalesces `to|chat_id`; `message_id` (the message to react to) is **required**. An **empty or
+  absent `emoji` removes** the bot's previous reaction. **MUST echo `chat_id` verbatim**, as for `/send`.
+- **Maps to** GOWA `POST /message/{message_id}/reaction {phone, emoji}` (the id is a URL path segment).
+- **Shim responses:** `200 {"reacted":true}`; `401` bad bearer; `400` missing destination or
+  `message_id`; `429` rate-limited; `400`/`502` map GOWA's 4xx/5xx as for `/send`.
 
 ### Chat presence (typing indicator) — `POST {WHATSAPP_GATEWAY_URL}/send/chat-presence` (agent → shim)
 

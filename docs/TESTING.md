@@ -62,9 +62,15 @@ Mirrors the plan's verification. **Acceptance = steps 2 + 3 + 4 pass.**
 
 ## 4. Media (P1.5 — when implemented)
 
-- ⬜ Inbound image/video/audio/document/sticker → caption surfaces in `body`; with `WHATSAPP_AUTO_DOWNLOAD_MEDIA`, local paths/URLs proxied to the agent's `media_urls` (contract extension — coordinate with the agent).
+- ⬜ Inbound image/audio/document → caption surfaces in `body`; **with `WHATSAPP_AUTO_DOWNLOAD_MEDIA=true` (required)**, the file is proxied to the agent as `media[{type,url,…}]` and `GET /media/<token>` (with the `/send` bearer) streams the bytes. With auto-download **off**, media silently drops (CDN URL the shim can't decrypt) — confirm the env is `true`.
 - ⬜ Golden fixtures per media type added to `tests/fixtures` and asserted.
 - ⬜ Outbound media send (`/send/image`, `/send/file`, …) mapped and bearer-gated.
+
+## 4b. Reactions (emoji)
+
+- ⬜ Inbound: react to a message in a DM → agent receives a `type:"reaction"` inbound with the emoji + `reacted_message_id`. Requires `WHATSAPP_WEBHOOK_EVENTS` to include `message.reaction`.
+- ⬜ Group policy: react to the bot's own message in a require-mention group → forwarded; react to someone else's → dropped.
+- ⬜ Outbound: `POST /send/reaction {chat_id, message_id, emoji}` → the emoji appears on the message in WhatsApp; empty `emoji` removes it. Bearer-gated + rate-limited.
 
 ## Release ritual
 
