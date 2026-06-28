@@ -146,6 +146,9 @@ mod tests {
             quoted_body: None,
             channel: DEFAULT_CHANNEL.into(),
             media: vec![],
+            kind: crate::model::InboundKind::Message,
+            reaction: None,
+            reacted_message_id: None,
         }
     }
 

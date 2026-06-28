@@ -56,8 +56,8 @@ APP_PORT=3000
 APP_BASIC_AUTH=${GOWA_BASIC_AUTH}
 WHATSAPP_WEBHOOK=http://127.0.0.1:8080/webhook/gowa
 WHATSAPP_WEBHOOK_SECRET=${GOWA_WEBHOOK_SECRET}
-WHATSAPP_WEBHOOK_EVENTS=message
-WHATSAPP_AUTO_DOWNLOAD_MEDIA=false
+WHATSAPP_WEBHOOK_EVENTS=message,message.reaction
+WHATSAPP_AUTO_DOWNLOAD_MEDIA=true
 EOF
 
 # --- shim secret credentials (0600; loaded via systemd LoadCredential=, never in /proc/environ) ---

@@ -14,7 +14,7 @@ schema, HMAC scheme, and DM/group sequence diagrams, and `deploy/README.md` for 
 
 ```sh
 cargo build
-cargo test                          # 60 unit + 29 e2e — no network, no WA account, no API spend
+cargo test                          # 64 unit + 36 e2e — no network, no WA account, no API spend
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all --check
 ```
@@ -44,10 +44,10 @@ e2e test `reply_to_bot_summons_in_require_mention_group` guards it.
 - `lib.rs` — module exports + `AppState`/`build_router` re-export (so tests drive the real router).
 - `config.rs` — env parsing + startup validation; `Config`, `PolicyConfig`, JID normalisation.
 - `error.rs` — `HttpError` (bad_request / unauthorized / rate_limited / upstream); never logs secrets.
-- `model.rs` — GOWA webhook wire types + the internal `Inbound`; structural drops; inbound media parsing.
-- `gowa.rs` — GOWA client (`/send/message`, `/send/{image,audio,file}`, static media fetch) + inbound HMAC verify over raw bytes.
+- `model.rs` — GOWA webhook wire types + the internal `Inbound`; structural drops; inbound media + reaction (`message.reaction`) parsing.
+- `gowa.rs` — GOWA client (`/send/message`, `/send/{image,audio,file}`, `/message/{id}/reaction`, static media fetch) + inbound HMAC verify over raw bytes.
 - `media.rs` — stateless `/media` proxy token signer (HMAC over the GOWA-relative path); no server state.
-- `agent.rs` — agent client (`POST /whatsapp/inbound` + bearer); forwards `{chat_id,body,id,from_me,channel,media}`.
+- `agent.rs` — agent client (`POST /whatsapp/inbound` + bearer); forwards `{chat_id,body,id,from_me,channel,media,type,reaction,reacted_message_id}`.
 - `channel.rs` — per-group channel routing: `ChannelRouter` (label→client + group→label) + the default channel.
 - `policy.rs` — **pure**, unit-tested admission policy (DM/group allowlist + require-mention).
 - `dedup.rs` — bounded-TTL `TtlSet` (drops GOWA re-deliveries).

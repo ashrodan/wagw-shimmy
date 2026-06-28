@@ -256,6 +256,9 @@ fn test_inbound(chat_id: &str, body: &str, id: &str) -> Inbound {
         quoted_body: None,
         channel: "default".into(),
         media: vec![],
+        kind: wagw_shimmy::model::InboundKind::Message,
+        reaction: None,
+        reacted_message_id: None,
     }
 }
 
@@ -1235,4 +1238,219 @@ async fn startup_drain_processes_a_preseeded_pending_file() {
     assert_eq!(bodies[0]["body"], "left over");
     drop(bodies);
     assert_eq!(queue.pending_len(), 0, "the drained file is removed");
+}
+
+// --- Reactions (inbound forward + outbound send) ---
+
+/// Records `(message_id_from_path, json_body)` for each `POST /message/{id}/reaction` — so a test can
+/// assert the message id rode in the URL path and the `{phone,emoji}` body was correct.
+type ReactionLog = Arc<Mutex<Vec<(String, Value)>>>;
+
+/// Spawn a mock GOWA exposing `POST /message/{message_id}/reaction` (recorded) + `/devices`.
+async fn spawn_mock_gowa_reaction() -> (String, ReactionLog) {
+    let log: ReactionLog = Arc::new(Mutex::new(Vec::new()));
+    let app = Router::new()
+        .route(
+            "/message/{message_id}/reaction",
+            post(
+                move |State(log): State<ReactionLog>,
+                      axum::extract::Path(message_id): axum::extract::Path<String>,
+                      Json(body): Json<Value>| async move {
+                    log.lock().await.push((message_id, body));
+                    Json(json!({ "code": "SUCCESS", "results": { "message_id": "REACT_OUT_1" } }))
+                },
+            ),
+        )
+        .route(
+            "/devices",
+            axum::routing::get(|| async { Json(json!({ "results": [] })) }),
+        )
+        .with_state(log.clone());
+    let addr = serve(app).await;
+    (format!("http://{addr}"), log)
+}
+
+#[tokio::test]
+async fn inbound_reaction_forwards_with_type_discriminator() {
+    let (agent_url, agent) = spawn_mock_agent().await;
+    let (gowa_url, _gowa) = spawn_mock_gowa("OUT_1").await;
+    let state = state_for(&gowa_url, &agent_url).await;
+    let _worker = state.spawn_forward_worker();
+    let router = build_router(state);
+
+    // A DM reaction (DM policy is Open) is forwarded as a `type:"reaction"` payload, no text/media.
+    assert_eq!(
+        post_webhook(&router, &fixture("reaction_dm.json")).await,
+        StatusCode::OK
+    );
+    wait_for_hits(&agent, 1).await;
+
+    let bodies = agent.bodies.lock().await;
+    assert_eq!(bodies.len(), 1);
+    assert_eq!(bodies[0]["type"], "reaction");
+    assert_eq!(bodies[0]["reaction"], "👍");
+    assert_eq!(bodies[0]["reacted_message_id"], "MSG_DM_1");
+    assert_eq!(bodies[0]["chat_id"], "61400111222@s.whatsapp.net");
+    assert_eq!(bodies[0]["body"], "");
+    // A reaction carries no media attachments.
+    assert!(bodies[0].get("media").is_none());
+}
+
+#[tokio::test]
+async fn reaction_to_bot_summons_in_require_mention_group() {
+    let (agent_url, agent) = spawn_mock_agent().await;
+    let (gowa_url, gowa) = spawn_mock_gowa("OUT_BOT_1").await;
+    let state = state_for(&gowa_url, &agent_url).await;
+    let _worker = state.spawn_forward_worker();
+    let router = build_router(state);
+
+    // 1. Bot sends into the group; GOWA returns OUT_BOT_1, which the shim records as its own id.
+    let send = Request::builder()
+        .method("POST")
+        .uri("/send")
+        .header("authorization", format!("Bearer {GATEWAY_BEARER}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({"chat_id":"120363000000000000@g.us","text":"hi group"}).to_string(),
+        ))
+        .unwrap();
+    assert_eq!(
+        router.clone().oneshot(send).await.unwrap().status(),
+        StatusCode::OK
+    );
+    wait_for_hits(&gowa, 1).await;
+
+    // 2. A group member reacts to that message (reacted_message_id = OUT_BOT_1) → counts as a
+    //    mention, so it forwards despite require_mention=true, and lands as a group reaction.
+    assert_eq!(
+        post_webhook(&router, &fixture("reaction_to_bot.json")).await,
+        StatusCode::OK
+    );
+    wait_for_hits(&agent, 1).await;
+    let bodies = agent.bodies.lock().await;
+    assert_eq!(bodies.len(), 1);
+    assert_eq!(bodies[0]["type"], "reaction");
+    assert_eq!(bodies[0]["chat_id"], "120363000000000000@g.us");
+    assert_eq!(bodies[0]["reacted_message_id"], "OUT_BOT_1");
+}
+
+#[tokio::test]
+async fn plain_group_reaction_dropped_under_require_mention() {
+    let (agent_url, agent) = spawn_mock_agent().await;
+    let (gowa_url, _gowa) = spawn_mock_gowa("OUT_1").await;
+    let state = state_for(&gowa_url, &agent_url).await;
+    let _worker = state.spawn_forward_worker();
+    let router = build_router(state);
+
+    // A reaction to someone *else's* message in a require-mention group is not addressed to the bot →
+    // dropped by policy (acked 200, never forwarded), exactly like a plain group message.
+    assert_eq!(
+        post_webhook(&router, &fixture("reaction_group_plain.json")).await,
+        StatusCode::OK
+    );
+    // Nothing should reach the agent.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        agent.hits(),
+        0,
+        "an un-addressed group reaction must not forward"
+    );
+}
+
+#[tokio::test]
+async fn send_reaction_forwards_to_gowa_with_path_id_and_body() {
+    let (agent_url, _agent) = spawn_mock_agent().await;
+    let (gowa_url, log) = spawn_mock_gowa_reaction().await;
+    let router = build_router(state_for(&gowa_url, &agent_url).await);
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/send/reaction")
+        .header("authorization", format!("Bearer {GATEWAY_BEARER}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({
+                "chat_id": "61400111222@s.whatsapp.net",
+                "message_id": "MSG_DM_1",
+                "emoji": "👍",
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let resp = router.oneshot(request).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let recorded = log.lock().await;
+    assert_eq!(recorded.len(), 1);
+    // The message id rides in the URL path; phone + emoji ride in the JSON body.
+    assert_eq!(recorded[0].0, "MSG_DM_1");
+    assert_eq!(recorded[0].1["phone"], "61400111222@s.whatsapp.net");
+    assert_eq!(recorded[0].1["emoji"], "👍");
+}
+
+#[tokio::test]
+async fn send_reaction_empty_emoji_is_accepted_as_unreact() {
+    let (agent_url, _agent) = spawn_mock_agent().await;
+    let (gowa_url, log) = spawn_mock_gowa_reaction().await;
+    let router = build_router(state_for(&gowa_url, &agent_url).await);
+
+    // An empty emoji is a valid "remove my reaction" — it must NOT 400.
+    let request = Request::builder()
+        .method("POST")
+        .uri("/send/reaction")
+        .header("authorization", format!("Bearer {GATEWAY_BEARER}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({"chat_id":"x@s.whatsapp.net","message_id":"MSG_DM_1","emoji":""}).to_string(),
+        ))
+        .unwrap();
+    let resp = router.oneshot(request).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let recorded = log.lock().await;
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0].1["emoji"], "");
+}
+
+#[tokio::test]
+async fn send_reaction_requires_bearer() {
+    let (agent_url, _agent) = spawn_mock_agent().await;
+    let (gowa_url, log) = spawn_mock_gowa_reaction().await;
+    let router = build_router(state_for(&gowa_url, &agent_url).await);
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/send/reaction")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({"chat_id":"x@s.whatsapp.net","message_id":"MSG_DM_1","emoji":"👍"}).to_string(),
+        ))
+        .unwrap();
+    let status = router.oneshot(request).await.unwrap().status();
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        log.lock().await.len(),
+        0,
+        "unauthenticated reaction must not reach GOWA"
+    );
+}
+
+#[tokio::test]
+async fn send_reaction_missing_message_id_is_bad_request() {
+    let (agent_url, _agent) = spawn_mock_agent().await;
+    let (gowa_url, log) = spawn_mock_gowa_reaction().await;
+    let router = build_router(state_for(&gowa_url, &agent_url).await);
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/send/reaction")
+        .header("authorization", format!("Bearer {GATEWAY_BEARER}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({"chat_id":"x@s.whatsapp.net","emoji":"👍"}).to_string(),
+        ))
+        .unwrap();
+    let status = router.oneshot(request).await.unwrap().status();
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(log.lock().await.len(), 0);
 }

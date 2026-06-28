@@ -59,6 +59,15 @@ pub struct GowaPayload {
     pub audio: Option<GowaMedia>,
     #[serde(default)]
     pub document: Option<GowaMedia>,
+    /// The emoji on a `message.reaction` event (the dedicated WhatsApp "react to a message"
+    /// feature). An empty string means the sender *removed* their reaction. Absent on a plain
+    /// `message` event.
+    #[serde(default)]
+    pub reaction: Option<String>,
+    /// On a `message.reaction` event, the id of the message being reacted to. Absent on a plain
+    /// `message` event.
+    #[serde(default)]
+    pub reacted_message_id: Option<String>,
 }
 
 /// A GOWA inbound media field, in either shape GOWA emits. Untagged so serde tries each variant by
@@ -110,6 +119,17 @@ pub enum DropReason {
     NonChat,
 }
 
+/// What kind of inbound this is. `Message` is the default (text and/or media); `Reaction` is a
+/// WhatsApp emoji reaction to an earlier message. Forwarded to the agent as the `type` discriminator
+/// (a normal message omits it, for byte-identical backward compatibility — see [`crate::agent`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum InboundKind {
+    #[default]
+    Message,
+    Reaction,
+}
+
 /// The shim's internal representation of an inbound message. Carries more than the forwarded
 /// contract: `sender` (DM allowlisting), `mentioned` (reply-to-bot), and `reply_to` never leave
 /// the shim — only `{chat_id, body, id, from_me}` is forwarded to the agent.
@@ -146,6 +166,20 @@ pub struct Inbound {
     /// empty vec), exactly like the `channel`/`quoted_body` precedent.
     #[serde(default)]
     pub media: Vec<MediaItem>,
+    /// The kind of inbound: text/media (`Message`) or an emoji `Reaction`. `#[serde(default)]` so a
+    /// pending file written before this field existed loads as `Message` (today's behaviour).
+    #[serde(default)]
+    pub kind: InboundKind,
+    /// On a reaction, the emoji the sender applied (an empty string means they *removed* it). `None`
+    /// for a normal message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reaction: Option<String>,
+    /// On a reaction, the id of the message being reacted to. `None` for a normal message. When this
+    /// matches one of the bot's own recently-sent ids, the reaction counts as addressing the bot
+    /// (see the mention logic in `server.rs`), so a reaction to the bot's message isn't dropped by a
+    /// require-mention group policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reacted_message_id: Option<String>,
 }
 
 /// The default value for [`Inbound::channel`]: the always-present default channel label.
@@ -186,32 +220,43 @@ impl Inbound {
 
 impl GowaEnvelope {
     /// Validate the structural preconditions and build the internal [`Inbound`], or return the
-    /// reason it was dropped. `mentioned` is left `false` here — the handler fills it from the
-    /// sent-id cache, which is runtime state this pure conversion has no business touching.
+    /// reason it was dropped. Dispatches on the GOWA event: `message` (text/media) and
+    /// `message.reaction` (emoji reaction) are accepted; everything else (call/ack/edit/revoke/…) is
+    /// dropped as [`DropReason::NotAMessageEvent`]. `mentioned` is left `false` here — the handler
+    /// fills it from the sent-id cache, which is runtime state this pure conversion has no business
+    /// touching.
     pub fn into_inbound(self) -> Result<Inbound, DropReason> {
-        if self.event != "message" {
-            return Err(DropReason::NotAMessageEvent);
+        match self.event.as_str() {
+            "message" => self.payload.into_message(),
+            "message.reaction" => self.payload.into_reaction(),
+            _ => Err(DropReason::NotAMessageEvent),
         }
-        let payload = self.payload;
-        if payload.is_from_me {
+    }
+}
+
+impl GowaPayload {
+    /// Build a text/media [`Inbound`] from a `message` event payload. Drops the bot's own echoes,
+    /// status/newsletter chats, and payloads missing a chat id / message id.
+    fn into_message(self) -> Result<Inbound, DropReason> {
+        if self.is_from_me {
             return Err(DropReason::FromMe);
         }
-        let chat_id = non_empty(payload.chat_id).ok_or(DropReason::MissingChatId)?;
+        let chat_id = non_empty(self.chat_id).ok_or(DropReason::MissingChatId)?;
         if is_non_chat(&chat_id) {
             return Err(DropReason::NonChat);
         }
-        let id = non_empty(payload.id).ok_or(DropReason::MissingId)?;
+        let id = non_empty(self.id).ok_or(DropReason::MissingId)?;
         // A group message has a distinct participant `from`; a DM may omit it, in which case the
         // sender *is* the chat. Fall back so DM allowlisting always has a JID to match.
-        let sender = non_empty(payload.from).unwrap_or_else(|| chat_id.clone());
+        let sender = non_empty(self.from).unwrap_or_else(|| chat_id.clone());
 
         // Collect present media, accumulating any media-object captions to fold into an empty body.
         let mut media = Vec::new();
         let mut captions: Vec<String> = Vec::new();
         for (kind, field) in [
-            ("image", payload.image),
-            ("audio", payload.audio),
-            ("document", payload.document),
+            ("image", self.image),
+            ("audio", self.audio),
+            ("document", self.document),
         ] {
             if let Some((item, caption)) = extract_media(kind, field) {
                 if let Some(caption) = caption {
@@ -223,7 +268,7 @@ impl GowaEnvelope {
 
         // GOWA usually puts a media caption in the top-level `body`; fold the media-object caption in
         // only when `body` is empty so we never double it.
-        let mut body = payload.body.unwrap_or_default();
+        let mut body = self.body.unwrap_or_default();
         if body.trim().is_empty() && !captions.is_empty() {
             body = captions.join("\n");
         }
@@ -235,10 +280,47 @@ impl GowaEnvelope {
             id,
             is_from_me: false,
             mentioned: false,
-            reply_to: non_empty(payload.replied_to_id),
-            quoted_body: non_empty(payload.quoted_body),
+            reply_to: non_empty(self.replied_to_id),
+            quoted_body: non_empty(self.quoted_body),
             channel: default_channel_label(),
             media,
+            kind: InboundKind::Message,
+            reaction: None,
+            reacted_message_id: None,
+        })
+    }
+
+    /// Build a reaction [`Inbound`] from a `message.reaction` event payload. Same structural drops as
+    /// a message; carries no text/media. The emoji is preserved verbatim (including an empty string,
+    /// which signals the sender *removed* their reaction) so the agent can tell react from un-react —
+    /// only `kind == Message` has `reaction == None`.
+    fn into_reaction(self) -> Result<Inbound, DropReason> {
+        if self.is_from_me {
+            return Err(DropReason::FromMe);
+        }
+        let chat_id = non_empty(self.chat_id).ok_or(DropReason::MissingChatId)?;
+        if is_non_chat(&chat_id) {
+            return Err(DropReason::NonChat);
+        }
+        // The reaction event carries its own id (dedup key); the *target* is `reacted_message_id`.
+        let id = non_empty(self.id).ok_or(DropReason::MissingId)?;
+        let sender = non_empty(self.from).unwrap_or_else(|| chat_id.clone());
+        let reaction = self.reaction.map(|emoji| emoji.trim().to_string());
+
+        Ok(Inbound {
+            chat_id,
+            sender,
+            body: String::new(),
+            id,
+            is_from_me: false,
+            mentioned: false,
+            reply_to: None,
+            quoted_body: None,
+            channel: default_channel_label(),
+            media: Vec::new(),
+            kind: InboundKind::Reaction,
+            reaction: Some(reaction.unwrap_or_default()),
+            reacted_message_id: non_empty(self.reacted_message_id),
         })
     }
 }
@@ -537,6 +619,56 @@ mod tests {
                 "chat_id":"61400111222@s.whatsapp.net","id":"m","body":"hi"}}"#,
         );
         assert!(env.into_inbound().unwrap().media.is_empty());
+    }
+
+    #[test]
+    fn message_event_is_kind_message_with_no_reaction_fields() {
+        let env = parse(
+            r#"{"event":"message","payload":{
+                "chat_id":"61400111222@s.whatsapp.net","id":"m","body":"hi"}}"#,
+        );
+        let inbound = env.into_inbound().unwrap();
+        assert_eq!(inbound.kind, InboundKind::Message);
+        assert!(inbound.reaction.is_none());
+        assert!(inbound.reacted_message_id.is_none());
+    }
+
+    #[test]
+    fn parses_reaction_event() {
+        let env = parse(
+            r#"{"event":"message.reaction","payload":{
+                "chat_id":"61400111222@s.whatsapp.net","from":"61400111222@s.whatsapp.net",
+                "id":"r1","reaction":"👍","reacted_message_id":"MSG_1"}}"#,
+        );
+        let inbound = env.into_inbound().unwrap();
+        assert_eq!(inbound.kind, InboundKind::Reaction);
+        assert_eq!(inbound.reaction.as_deref(), Some("👍"));
+        assert_eq!(inbound.reacted_message_id.as_deref(), Some("MSG_1"));
+        assert_eq!(inbound.id, "r1");
+        assert!(inbound.body.is_empty());
+        assert!(inbound.media.is_empty());
+    }
+
+    #[test]
+    fn empty_reaction_is_preserved_as_unreact() {
+        // An empty emoji means the user removed their reaction — it must survive as `Some("")`, not
+        // collapse to `None` (which means "not a reaction").
+        let env = parse(
+            r#"{"event":"message.reaction","payload":{
+                "chat_id":"61400111222@s.whatsapp.net","id":"r1","reaction":"","reacted_message_id":"MSG_1"}}"#,
+        );
+        let inbound = env.into_inbound().unwrap();
+        assert_eq!(inbound.kind, InboundKind::Reaction);
+        assert_eq!(inbound.reaction.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn drops_from_me_reaction() {
+        let env = parse(
+            r#"{"event":"message.reaction","payload":{
+                "chat_id":"x@s.whatsapp.net","id":"r1","is_from_me":true,"reaction":"👍"}}"#,
+        );
+        assert_eq!(env.into_inbound().unwrap_err(), DropReason::FromMe);
     }
 
     #[test]

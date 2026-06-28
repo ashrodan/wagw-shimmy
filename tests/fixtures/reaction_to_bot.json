@@ -1,0 +1,14 @@
+{
+  "event": "message.reaction",
+  "device_id": "61400000000@s.whatsapp.net",
+  "payload": {
+    "id": "REACT_GROUP_1",
+    "chat_id": "120363000000000000@g.us",
+    "from": "61400111222@s.whatsapp.net",
+    "from_name": "Jane Doe",
+    "timestamp": "2026-06-13T10:50:00Z",
+    "is_from_me": false,
+    "reaction": "❤️",
+    "reacted_message_id": "OUT_BOT_1"
+  }
+}

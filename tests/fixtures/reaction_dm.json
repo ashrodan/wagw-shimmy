@@ -1,0 +1,14 @@
+{
+  "event": "message.reaction",
+  "device_id": "61400000000@s.whatsapp.net",
+  "payload": {
+    "id": "REACT_DM_1",
+    "chat_id": "61400111222@s.whatsapp.net",
+    "from": "61400111222@s.whatsapp.net",
+    "from_name": "Jane Doe",
+    "timestamp": "2026-06-13T10:45:00Z",
+    "is_from_me": false,
+    "reaction": "👍",
+    "reacted_message_id": "MSG_DM_1"
+  }
+}
