@@ -25,15 +25,34 @@ policy:
   group_policy: allowlist         # off | allowlist | open
   group_allow:
     - "120363428950046857@g.us"   # "Bae Bot Test group 1" (owner 61425700099)
+    - "120363408568709901@g.us"   # added 2026-06-21 — routes to default agent
   require_mention: true           # DEFAULT now true: reply only when addressed (@-tag of self_number,
                                   # or reply-to-bot). Set false only to make it answer every group message.
   free_response_chats: []
   send_rate_per_min: 20
 
-# Per-group channel routing (deploy/channels-env.awk): none configured → single "default" channel.
-# Note: wagw-1 still runs the OLD pre-channel-routing shim binary; redeploy before relying on this.
-# channels: []
-# group_channels: []
+# Per-group channel routing (deploy/channels-env.awk).
+# Note: wagw-1 still runs the OLD pre-channel-routing shim binary; REDEPLOY the shim to a
+# channel-routing build before this takes effect (rendered to WA_CHANNELS / WA_CHANNEL_*_URL /
+# WA_GROUP_CHANNELS on the box). See docs/CHANNEL-CONNECTIONS.md §A.
+#
+# `dashi` — the ops agent box (spike-rust-agent instance "Dashi", dashi.exe.xyz). Inbound forwards
+# travel over the exe.dev peering `wagw1-to-dashi` (attached to wagw-1, peer = dashi, → its :8000);
+# the URL below is that peering hostname (/whatsapp/inbound is appended). Replies come back to THIS
+# shim's /send by chat_id (shared reply edge — no per-channel reply token). Dashi's agent-side env is
+# scaffolded in spike-rust-agent: .env.dashi + the deployment registry in its docs/RELEASE.md.
+channels:
+  - label: dashi
+    url: "https://wagw1-to-dashi.int.exe.xyz"
+    token_secret: wagw-1/dashi_webhook_token   # distinct inbound bearer for this channel; omit to
+                                               # reuse the default whatsapp_webhook_token instead.
+group_channels:
+  # "Dashi by Dashlytix" — resolved 2026-06-28 from invite chat.whatsapp.com/HwmvvUoOA39FFJTQpo4XDc
+  # via GOWA /group/info-from-link. A mapped group is implicitly admitted (no need to also list it in
+  # policy.group_allow). NOTE: the linked device must JOIN this group before messages arrive
+  # (POST /group/join-with-link) — outward action on the live account, do at go-live.
+  - jid: "120363409170508840@g.us"
+    channel: dashi
 
 # Downstream agent — NOT yet wired to a working spike-rust-agent.
 # AGENT_INBOUND_URL on the box currently points at the OLD Hermes agent
@@ -50,6 +69,8 @@ secrets:
   gowa_webhook_secret: wagw-1/gowa_webhook_secret
   whatsapp_webhook_token: wagw-1/whatsapp_webhook_token
   whatsapp_gateway_token: wagw-1/whatsapp_gateway_token
+  dashi_webhook_token: wagw-1/dashi_webhook_token         # inbound bearer for the `dashi` channel;
+                                                          # same value must be set as WHATSAPP_WEBHOOK_TOKEN in spike-rust-agent's .env.dashi
 
 # Backups: pairing session lives in /var/lib/wagw/gowa/whatsapp.db (whatsmeow keys — SECRET, never in
 # git). On-box snapshot: /var/lib/wagw/gowa/whatsapp-firstpair-20260616-100411.db. Off-box copy taken
