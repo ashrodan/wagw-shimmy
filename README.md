@@ -44,6 +44,7 @@ Envelope: `{ "event": "...", "device_id": "...", "payload": { … } }`. Fields t
 | `replied_to_id` | id of the quoted message → powers reply-to-bot mention detection.        |
 | `image`/`audio`/`document` | media attachment (string path or `{path,caption}` object) → forwarded as `media[]`. |
 | `reaction`/`reacted_message_id` | on a `message.reaction` event: the emoji + the id it reacts to → forwarded as a `type:"reaction"` inbound. |
+| `call_id`/`from`/`group_jid`/`auto_rejected` | on a `call.offer` event (incoming call): forwarded as a `type:"call"` inbound (signalling only — GOWA can't answer audio). |
 
 `status@broadcast` and `…@newsletter` chats are dropped. Deserialisation is lenient (all fields
 optional, unknowns ignored) so a payload-shape drift degrades to a dropped message, not a 500.
@@ -66,7 +67,7 @@ sequenceDiagram
     participant Agent
     GOWA->>Shim: POST /webhook/gowa  (X-Hub-Signature-256)
     Note over Shim: verify HMAC over raw bytes → 401 on mismatch
-    Note over Shim: drop if event∉{message,message.reaction} / is_from_me / status / newsletter
+    Note over Shim: drop if event∉{message,message.reaction,call.offer} / is_from_me / status / newsletter
     Note over Shim: mentioned = replied_to_id ∈ recent sent ids
     Note over Shim: dedup on id (GOWA re-delivers)
     Note over Shim: policy: dm/group allowlist + require-mention
@@ -135,6 +136,17 @@ the bot's own recent messages counts as a mention (so it isn't dropped in a requ
 like `/send`) → GOWA `POST /message/{message_id}/reaction`. An empty/absent `emoji` removes the bot's
 reaction. Full shape in [`docs/AGENT-WHATSAPP-CONTRACT.md`](docs/AGENT-WHATSAPP-CONTRACT.md).
 
+## Calls (incoming)
+
+**Inbound only, signalling — GOWA/whatsmeow cannot answer call audio.** A GOWA `call.offer` event is
+forwarded to the agent as a `type:"call"` inbound carrying `{chat_id, id (=call_id), auto_rejected,
+remote_platform?}`, so the agent can react (e.g. auto-text the caller). `chat_id` is the group JID
+for a group call, else the caller's DM JID — reply there as usual. A call is treated as a **direct
+summon** (it passes a require-mention group), but the DM/group **allowlist still applies**. Requires
+`WHATSAPP_WEBHOOK_EVENTS` to include `call.offer`. GOWA's only reject lever at the pinned v8.7.0 is
+the global `WHATSAPP_AUTO_REJECT_CALL` flag (surfaced as `auto_rejected`); selective per-call reject
+needs a later GOWA (`POST /call/reject`). Full shape in [`docs/AGENT-WHATSAPP-CONTRACT.md`](docs/AGENT-WHATSAPP-CONTRACT.md).
+
 `SHIM_MEDIA_BASE_URL` (default `http://{SHIM_BIND}`) must equal the agent's `WHATSAPP_GATEWAY_URL`.
 Auto-download-off (CDN-URL inbound) and video/sticker are out of scope; see [`docs/HARDENING.md`](docs/HARDENING.md).
 Full normative shape in [`docs/AGENT-WHATSAPP-CONTRACT.md`](docs/AGENT-WHATSAPP-CONTRACT.md).
@@ -145,8 +157,9 @@ See [`.env.example`](.env.example) for the full list. Boot is fail-fast: a missi
 or unknown policy enum aborts startup. Error messages name the offending *variable*, never its value.
 
 GOWA-side settings (set on GOWA, not the shim): webhook URL → `http://127.0.0.1:8080/webhook/gowa`,
-`WHATSAPP_WEBHOOK_EVENTS=message,message.reaction` (filter at source — `message.reaction` enables
-inbound emoji reactions), `WHATSAPP_AUTO_DOWNLOAD_MEDIA=true` (**required** for inbound media: GOWA
+`WHATSAPP_WEBHOOK_EVENTS=message,message.reaction,call.offer` (filter at source — `message.reaction`
+enables inbound emoji reactions, `call.offer` enables incoming-call events; add
+`WHATSAPP_AUTO_REJECT_CALL=true` to auto-reject calls at GOWA), `WHATSAPP_AUTO_DOWNLOAD_MEDIA=true` (**required** for inbound media: GOWA
 must write the file to its local `statics/media/` store for the `/media` proxy to re-serve it — with
 it off, images/attachments arrive as CDN URLs the shim can't decrypt and are silently dropped),
 `WHATSAPP_WEBHOOK_SECRET=<GOWA_WEBHOOK_SECRET>`. The agent's `WHATSAPP_GATEWAY_URL` points at the

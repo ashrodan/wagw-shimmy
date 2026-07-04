@@ -211,7 +211,12 @@ async fn webhook_gowa(State(state): State<AppState>, headers: HeaderMap, body: B
     // A reply *or* a reaction that references one of the bot's own recently-sent ids counts as
     // addressing the bot — so a reaction to the bot's message in a require-mention group isn't
     // dropped by policy. `reacted_message_id` is `None` for a normal message, so this is a no-op there.
-    inbound.mentioned = tagged
+    // A call is itself a direct, real-time summon of this number, so it always counts as addressed:
+    // this lets a call through a require-mention group while the DM/group *allowlist* still applies
+    // (a call from a non-allowlisted DM sender, or in a non-allowlisted group, is still dropped).
+    let is_call = inbound.kind == crate::model::InboundKind::Call;
+    inbound.mentioned = is_call
+        || tagged
         || state.sent_ids.is_reply_to_bot(inbound.reply_to.as_deref())
         || state
             .sent_ids

@@ -105,6 +105,30 @@ When a WhatsApp user reacts to a message (the 👍 feature), the shim forwards a
   counts as addressing the bot (forwarded); other group reactions are dropped, like a plain group
   message. DMs always forward (subject to the DM allowlist).
 
+#### Inbound calls — `type: "call"` (shim → agent)
+
+When someone places a WhatsApp voice/video **call** to the number, the shim forwards a call event.
+whatsmeow (and therefore GOWA) is **signalling-only**: it can *observe* and *reject* a call but has
+no media stack to *answer* audio, so this is a notification the agent can react to (e.g. auto-text
+the caller "I can't take calls, message me instead"), **not** a live audio stream.
+
+| field | type | notes |
+|---|---|---|
+| `type` | string | `"call"` |
+| `chat_id` | string | conversation JID — the **reply key**. For a **group** call it's the group JID; for a **1:1** call it's the caller's DM JID. Reply/text here as usual. |
+| `id` | string | GOWA's `call_id` (dedup / idempotency key) — a call carries no message id |
+| `auto_rejected` | bool | `true` if GOWA already auto-rejected it (`WHATSAPP_AUTO_REJECT_CALL=true`). When `true`, the agent need only notify; when `false`, the call may still be ringing |
+| `remote_platform` | string? | caller's platform (`"android"`/`"ios"`/…) when GOWA reports it |
+| `body` | string | empty for a call |
+
+- **Requires GOWA to forward it:** `WHATSAPP_WEBHOOK_EVENTS` MUST include `call.offer`.
+- **Policy:** a call is treated as a **direct summon**, so it passes a require-mention group without
+  an @-tag or reply-to-bot. The DM/group **allowlist still applies** — a call from a non-allowlisted
+  DM sender, or in a non-allowlisted group, is dropped exactly like a message.
+- **Note:** the shim does not itself reject or answer the call; it only relays the event. Selective
+  programmatic reject needs a GOWA `POST /call/reject` (added after the pinned v8.7.0); today GOWA's
+  only lever is the global `WHATSAPP_AUTO_REJECT_CALL` flag, already reflected in `auto_rejected`.
+
 ### Outbound — `POST {WHATSAPP_GATEWAY_URL}{SEND_PATH}` (agent → shim), default `/send`
 
 - **Auth:** the agent sends `Authorization: Bearer <WHATSAPP_GATEWAY_TOKEN>`.
