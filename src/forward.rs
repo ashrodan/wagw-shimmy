@@ -54,6 +54,11 @@ impl ForwardQueue {
         let dead = queue_dir.join("dead");
         fs::create_dir_all(&pending)?;
         fs::create_dir_all(&dead)?;
+        // A crash between `File::create(<hex>.json.tmp)` and the atomic rename in `enqueue` leaves a
+        // stale `.tmp` that `drain_pending` correctly skips but nothing ever deletes — an unbounded
+        // disk leak over enough crashes. Reap them at open (a tmp is always incomplete, never the
+        // authoritative record). Best-effort: a removal failure is logged, not fatal.
+        reap_tmp_files(&pending);
         Ok(Self {
             pending,
             dead,
@@ -330,6 +335,24 @@ fn move_to_dead(path: &Path, dead: &Path) -> Option<PathBuf> {
     }
 }
 
+/// Delete any leftover `*.tmp` files in `dir` — partial enqueue writes abandoned by a crash. Called
+/// once at queue open; best-effort (a failure is logged, never fatal).
+fn reap_tmp_files(dir: &Path) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) == Some("tmp") {
+            if let Err(error) = fs::remove_file(&path) {
+                tracing::warn!(?path, %error, "failed to reap stale queue tmp file");
+            } else {
+                tracing::info!(?path, "reaped stale queue tmp file");
+            }
+        }
+    }
+}
+
 fn count_json(dir: &Path) -> usize {
     fs::read_dir(dir)
         .map(|entries| {
@@ -424,6 +447,25 @@ mod tests {
         let bytes = fs::read(dir.join("pending").join(format!("{stem}.json"))).unwrap();
         let restored: Inbound = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(restored, original);
+    }
+
+    #[test]
+    fn reopen_reaps_stale_tmp_but_keeps_pending_json() {
+        let dir = unique_dir();
+        let queue = ForwardQueue::new(&dir).unwrap();
+        queue.enqueue(&sample("KEEP")).unwrap();
+
+        // Simulate a crash mid-enqueue: a leftover `.tmp` with no matching rename.
+        let stray = dir.join("pending").join("deadbeef.json.tmp");
+        fs::write(&stray, b"partial").unwrap();
+        assert!(stray.exists());
+
+        // Reopening the queue reaps the tmp but leaves the committed `.json` untouched.
+        let reopened = ForwardQueue::new(&dir).unwrap();
+        assert!(!stray.exists());
+        assert_eq!(reopened.pending_len(), 1);
+        let stem = hex::encode(b"KEEP");
+        assert!(dir.join("pending").join(format!("{stem}.json")).exists());
     }
 
     #[test]

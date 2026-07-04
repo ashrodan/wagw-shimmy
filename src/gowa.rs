@@ -309,16 +309,24 @@ impl GowaClient {
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|value| value.to_str().ok())
             .map(str::to_string);
-        let bytes = response.bytes().await.map_err(|error| {
+        // Accumulate chunk-by-chunk with an early abort, so a response that omits `Content-Length`
+        // (the cheap pre-check above) still can't force us to buffer more than the cap: we stop
+        // reading the instant the running total would exceed `MAX_MEDIA_BYTES`, rather than pulling
+        // the whole body into memory and only then measuring it.
+        let mut response = response;
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|error| {
             HttpError::Upstream(format!("GOWA static read failed: {}", classify(&error)))
-        })?;
-        if bytes.len() as u64 > MAX_MEDIA_BYTES {
-            return Err(HttpError::BadRequest("GOWA media too large".to_string()));
+        })? {
+            if body.len() as u64 + chunk.len() as u64 > MAX_MEDIA_BYTES {
+                return Err(HttpError::BadRequest("GOWA media too large".to_string()));
+            }
+            body.extend_from_slice(&chunk);
         }
         Ok(StaticFetch {
             status,
             content_type,
-            body: bytes.to_vec(),
+            body,
         })
     }
 
