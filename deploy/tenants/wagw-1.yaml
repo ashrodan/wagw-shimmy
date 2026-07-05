@@ -25,16 +25,17 @@ policy:
   group_policy: allowlist         # off | allowlist | open
   group_allow:
     - "120363428950046857@g.us"   # "Bae Bot Test group 1" (owner 61425700099)
-    - "120363408568709901@g.us"   # added 2026-06-21 — routes to default agent
+    - "120363408568709901@g.us"   # "2 baes" — added 2026-06-21; remapped to `hermes` channel
+                                  # 2026-07-05 (see group_channels; entry here is now redundant
+                                  # but harmless — mapped groups are implicitly admitted)
   require_mention: true           # DEFAULT now true: reply only when addressed (@-tag of self_number,
                                   # or reply-to-bot). Set false only to make it answer every group message.
   free_response_chats: []
   send_rate_per_min: 20
 
 # Per-group channel routing (deploy/channels-env.awk).
-# Note: wagw-1 still runs the OLD pre-channel-routing shim binary; REDEPLOY the shim to a
-# channel-routing build before this takes effect (rendered to WA_CHANNELS / WA_CHANNEL_*_URL /
-# WA_GROUP_CHANNELS on the box). See docs/CHANNEL-CONNECTIONS.md §A.
+# 2026-07-04: the live shim IS a channel-routing build (WA_CHANNELS=dashi,hermes confirmed on the
+# box) — the old "pre-channel-routing binary" caveat no longer applies. See docs/CHANNEL-CONNECTIONS.md §A.
 #
 # `dashi` — the ops agent box (spike-rust-agent instance "Dashi", dashi.exe.xyz). Inbound forwards
 # travel over the exe.dev peering `wagw1-to-dashi` (attached to wagw-1, peer = dashi, → its :8000);
@@ -46,6 +47,19 @@ channels:
     url: "https://wagw1-to-dashi.int.exe.xyz"
     token_secret: wagw-1/dashi_webhook_token   # distinct inbound bearer for this channel; omit to
                                                # reuse the default whatsapp_webhook_token instead.
+  # `hermes` — Hermes Agent on bird-tortoise.exe.xyz, wired 2026-07-04. Hermes has no native
+  # /whatsapp/inbound, so `wagw-hermes-adapter` (systemd unit on bird-tortoise, :8000,
+  # ~/wagw-hermes-adapter/adapter.py) implements AGENT-WHATSAPP-CONTRACT: bearer-auth inbound,
+  # dedup on id, ack-fast, then a `wagw chat -Q --resume <session>` turn (Hermes profile "wagw",
+  # per-chat session map in ~/wagw-hermes-adapter/sessions.json) and a reply to this shim's /send.
+  # Peerings: wagw1-to-hermes (wagw-1 → bird-tortoise:8000), hermes-to-wagw1 (bird-tortoise →
+  # wagw-1:8080). Adapter env: /etc/wagw-hermes-adapter.env (0600) on bird-tortoise. To route
+  # more groups to another Hermes *profile*: create the profile, add a label here + a
+  # CHANNEL_PROFILES entry (label:wrapper) in the adapter env — same adapter, same peerings.
+  - label: hermes
+    url: "https://wagw1-to-hermes.int.exe.xyz"
+    token_secret: wagw-1/hermes_webhook_token  # value also in /etc/wagw-hermes-adapter.env on
+                                               # bird-tortoise (WHATSAPP_WEBHOOK_TOKEN)
 group_channels:
   # "Dashi by Dashlytix" — resolved 2026-06-28 from invite chat.whatsapp.com/HwmvvUoOA39FFJTQpo4XDc
   # via GOWA /group/info-from-link. A mapped group is implicitly admitted (no need to also list it in
@@ -53,6 +67,14 @@ group_channels:
   # (POST /group/join-with-link) — outward action on the live account, do at go-live.
   - jid: "120363409170508840@g.us"
     channel: dashi
+  # Hermes groups: add each group the bot is invited to as `- jid: "<...>@g.us" / channel: hermes`
+  # and mirror it into WA_GROUP_CHANNELS on the box (comma-append `<jid>:hermes`), then
+  # `systemctl restart wagw-shimmy`. Mapped groups are implicitly admitted; require_mention still
+  # applies (@-tag the bot or reply to it).
+  # "2 baes" — resolved 2026-07-05 from invite chat.whatsapp.com/GcYWBut3M1jKxhexx9YHjz via GOWA
+  # /group/info-from-link; bot already a member (in group_allow since 2026-06-21).
+  - jid: "120363408568709901@g.us"
+    channel: hermes
 
 # Downstream agent — NOT yet wired to a working spike-rust-agent.
 # AGENT_INBOUND_URL on the box currently points at the OLD Hermes agent
@@ -60,7 +82,10 @@ group_channels:
 # also 404s on /whatsapp/inbound (WhatsApp channel not enabled). The shim is held in DEBUG SINK
 # (SHIM_DEBUG_SINK=true drop-in) until a real spike-rust-agent inbound endpoint exists.
 agent_inbound_url: "https://wagw1-to-agent.int.exe.xyz"   # TODO: repoint at a real spike-rust-agent
-debug_sink: true                                          # TODO: turn off before real traffic
+                                                          # (or at wagw1-to-hermes to make Hermes
+                                                          # the default channel for DMs too)
+debug_sink: false                                         # confirmed off on the box 2026-07-04
+                                                          # (no SHIM_DEBUG_SINK drop-in)
 
 # Secret NAMES — wagw-1's secrets are currently INLINE on the box (manual setup), not in a store.
 # TODO: migrate to the store + LoadCredential on the next full provision.
@@ -71,6 +96,10 @@ secrets:
   whatsapp_gateway_token: wagw-1/whatsapp_gateway_token
   dashi_webhook_token: wagw-1/dashi_webhook_token         # inbound bearer for the `dashi` channel;
                                                           # same value must be set as WHATSAPP_WEBHOOK_TOKEN in spike-rust-agent's .env.dashi
+  hermes_webhook_token: wagw-1/hermes_webhook_token       # inbound bearer for the `hermes` channel;
+                                                          # same value in /etc/wagw-hermes-adapter.env
+                                                          # on bird-tortoise (generated 2026-07-04,
+                                                          # currently inline on both boxes, not in a store)
 
 # Backups: pairing session lives in /var/lib/wagw/gowa/whatsapp.db (whatsmeow keys — SECRET, never in
 # git). On-box snapshot: /var/lib/wagw/gowa/whatsapp-firstpair-20260616-100411.db. Off-box copy taken

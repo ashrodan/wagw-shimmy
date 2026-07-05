@@ -1,0 +1,18 @@
+[Unit]
+Description=wagw-hermes-adapter — WhatsApp shim to Hermes profile bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=exedev
+WorkingDirectory=/home/exedev
+EnvironmentFile=/etc/wagw-hermes-adapter.env
+Environment=PATH=/home/exedev/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/python3 /home/exedev/wagw-hermes-adapter/adapter.py
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
