@@ -259,6 +259,8 @@ fn test_inbound(chat_id: &str, body: &str, id: &str) -> Inbound {
         kind: wagw_shimmy::model::InboundKind::Message,
         reaction: None,
         reacted_message_id: None,
+        auto_rejected: None,
+        remote_platform: None,
     }
 }
 
@@ -536,6 +538,41 @@ async fn reply_to_bot_summons_in_require_mention_group() {
     assert_eq!(bodies.len(), 1);
     // The reply is answered IN THE GROUP — chat_id is the group JID, not the sender's DM JID.
     assert_eq!(bodies[0]["chat_id"], "120363000000000000@g.us");
+}
+
+#[tokio::test]
+async fn call_offer_is_forwarded_as_type_call_despite_require_mention() {
+    let (agent_url, agent) = spawn_mock_agent().await;
+    let (gowa_url, _gowa) = spawn_mock_gowa("OUT_CALL").await;
+    let state = state_for(&gowa_url, &agent_url).await;
+    let _worker = state.spawn_forward_worker();
+    let router = build_router(state);
+
+    // A group call (require_mention=true in test_config): a call is a direct summon, so it forwards
+    // even though nobody @-tagged or replied to the bot. chat_id must be the GROUP (the reply key),
+    // and the discriminator must be type:"call" carrying the auto_rejected status.
+    let call = json!({
+        "event": "call.offer",
+        "device_id": "d",
+        "payload": {
+            "call_id": "CALL_E2E",
+            "from": "61400111222@s.whatsapp.net",
+            "group_jid": "120363000000000000@g.us",
+            "auto_rejected": true,
+            "remote_platform": "ios"
+        }
+    })
+    .to_string();
+    assert_eq!(post_webhook(&router, &call).await, StatusCode::OK);
+
+    wait_for_hits(&agent, 1).await;
+    let bodies = agent.bodies.lock().await;
+    assert_eq!(bodies.len(), 1);
+    assert_eq!(bodies[0]["type"], "call");
+    assert_eq!(bodies[0]["chat_id"], "120363000000000000@g.us");
+    assert_eq!(bodies[0]["id"], "CALL_E2E");
+    assert_eq!(bodies[0]["auto_rejected"], true);
+    assert_eq!(bodies[0]["remote_platform"], "ios");
 }
 
 #[tokio::test]

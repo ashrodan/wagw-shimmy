@@ -68,6 +68,21 @@ pub struct GowaPayload {
     /// `message` event.
     #[serde(default)]
     pub reacted_message_id: Option<String>,
+    /// On a `call.offer` event, the call's unique id (GOWA's `payload.call_id`). Used as the
+    /// [`Inbound`] idempotency id — a call carries no message `id`. Absent on other events.
+    #[serde(default)]
+    pub call_id: Option<String>,
+    /// On a `call.offer` event, whether GOWA already auto-rejected the call
+    /// (`WHATSAPP_AUTO_REJECT_CALL=true`). Absent (deserialises to `false`) on other events.
+    #[serde(default)]
+    pub auto_rejected: bool,
+    /// On a `call.offer` event, the caller's platform (`"android"`/`"ios"`/…) when GOWA reports it.
+    #[serde(default)]
+    pub remote_platform: Option<String>,
+    /// On a `call.offer` event for a *group* call, the group JID. Absent for a 1:1 call (where the
+    /// caller `from` is the conversation).
+    #[serde(default)]
+    pub group_jid: Option<String>,
 }
 
 /// A GOWA inbound media field, in either shape GOWA emits. Untagged so serde tries each variant by
@@ -128,6 +143,10 @@ pub enum InboundKind {
     #[default]
     Message,
     Reaction,
+    /// A `call.offer` — an incoming WhatsApp voice/video call. whatsmeow (and thus GOWA) is
+    /// signalling-only: it can *observe* and *reject* a call but never *answer* audio, so this is a
+    /// notification the agent can react to (e.g. auto-text the caller), not a media stream.
+    Call,
 }
 
 /// The shim's internal representation of an inbound message. Carries more than the forwarded
@@ -180,6 +199,14 @@ pub struct Inbound {
     /// require-mention group policy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reacted_message_id: Option<String>,
+    /// On a `Call`, whether GOWA already auto-rejected it. `None` for a non-call. Forwarded so the
+    /// agent knows whether it still needs to act (e.g. text the caller) or merely notify.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_rejected: Option<bool>,
+    /// On a `Call`, the caller's platform when GOWA reports it (`"android"`/`"ios"`/…). `None`
+    /// otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_platform: Option<String>,
 }
 
 /// The default value for [`Inbound::channel`]: the always-present default channel label.
@@ -220,15 +247,16 @@ impl Inbound {
 
 impl GowaEnvelope {
     /// Validate the structural preconditions and build the internal [`Inbound`], or return the
-    /// reason it was dropped. Dispatches on the GOWA event: `message` (text/media) and
-    /// `message.reaction` (emoji reaction) are accepted; everything else (call/ack/edit/revoke/…) is
-    /// dropped as [`DropReason::NotAMessageEvent`]. `mentioned` is left `false` here — the handler
-    /// fills it from the sent-id cache, which is runtime state this pure conversion has no business
-    /// touching.
+    /// reason it was dropped. Dispatches on the GOWA event: `message` (text/media),
+    /// `message.reaction` (emoji reaction), and `call.offer` (incoming call) are accepted; everything
+    /// else (ack/edit/revoke/…) is dropped as [`DropReason::NotAMessageEvent`]. `mentioned` is left
+    /// `false` here — the handler fills it from the sent-id cache (and marks calls addressed), which
+    /// is runtime state this pure conversion has no business touching.
     pub fn into_inbound(self) -> Result<Inbound, DropReason> {
         match self.event.as_str() {
             "message" => self.payload.into_message(),
             "message.reaction" => self.payload.into_reaction(),
+            "call.offer" => self.payload.into_call(),
             _ => Err(DropReason::NotAMessageEvent),
         }
     }
@@ -287,6 +315,8 @@ impl GowaPayload {
             kind: InboundKind::Message,
             reaction: None,
             reacted_message_id: None,
+            auto_rejected: None,
+            remote_platform: None,
         })
     }
 
@@ -321,6 +351,42 @@ impl GowaPayload {
             kind: InboundKind::Reaction,
             reaction: Some(reaction.unwrap_or_default()),
             reacted_message_id: non_empty(self.reacted_message_id),
+            auto_rejected: None,
+            remote_platform: None,
+        })
+    }
+
+    /// Build a call [`Inbound`] from a `call.offer` event payload. A call carries no `chat_id` and no
+    /// message `id`: the conversation is the `group_jid` for a group call, else the caller `from`
+    /// (a 1:1 call is a DM with the caller); the idempotency id is GOWA's `call_id`. Body is empty —
+    /// a call has no text — and the agent keys on `kind == Call` (forwarded as `type:"call"`).
+    fn into_call(self) -> Result<Inbound, DropReason> {
+        // A call always originates from the caller; without one there is nowhere to route a reply.
+        let caller = non_empty(self.from).ok_or(DropReason::MissingChatId)?;
+        // Group call → the group is the conversation; 1:1 call → the caller is.
+        let chat_id = non_empty(self.group_jid).unwrap_or_else(|| caller.clone());
+        if is_non_chat(&chat_id) {
+            return Err(DropReason::NonChat);
+        }
+        // `call_id` is the dedup key and the durable-queue filename stem; a call with none is unusable.
+        let id = non_empty(self.call_id).ok_or(DropReason::MissingId)?;
+
+        Ok(Inbound {
+            chat_id,
+            sender: caller,
+            body: String::new(),
+            id,
+            is_from_me: false,
+            mentioned: false,
+            reply_to: None,
+            quoted_body: None,
+            channel: default_channel_label(),
+            media: Vec::new(),
+            kind: InboundKind::Call,
+            reaction: None,
+            reacted_message_id: None,
+            auto_rejected: Some(self.auto_rejected),
+            remote_platform: non_empty(self.remote_platform),
         })
     }
 }
@@ -669,6 +735,55 @@ mod tests {
                 "chat_id":"x@s.whatsapp.net","id":"r1","is_from_me":true,"reaction":"👍"}}"#,
         );
         assert_eq!(env.into_inbound().unwrap_err(), DropReason::FromMe);
+    }
+
+    #[test]
+    fn parses_dm_call_offer() {
+        // A 1:1 call: no group_jid, so the caller is the conversation. call_id becomes the id.
+        let env = parse(
+            r#"{"event":"call.offer","device_id":"d","payload":{
+                "call_id":"CALL_1","from":"61400111222@s.whatsapp.net",
+                "auto_rejected":false,"remote_platform":"android"}}"#,
+        );
+        let inbound = env.into_inbound().unwrap();
+        assert_eq!(inbound.kind, InboundKind::Call);
+        assert_eq!(inbound.chat_id, "61400111222@s.whatsapp.net");
+        assert_eq!(inbound.sender, "61400111222@s.whatsapp.net");
+        assert_eq!(inbound.id, "CALL_1");
+        assert_eq!(inbound.auto_rejected, Some(false));
+        assert_eq!(inbound.remote_platform.as_deref(), Some("android"));
+        assert!(inbound.body.is_empty());
+        assert!(!inbound.is_group());
+    }
+
+    #[test]
+    fn parses_group_call_offer_routes_to_group() {
+        // A group call: group_jid is the conversation (the reply key), from stays the caller.
+        let env = parse(
+            r#"{"event":"call.offer","payload":{
+                "call_id":"CALL_2","from":"61400111222@s.whatsapp.net",
+                "group_jid":"123-456@g.us","auto_rejected":true}}"#,
+        );
+        let inbound = env.into_inbound().unwrap();
+        assert_eq!(inbound.kind, InboundKind::Call);
+        assert_eq!(inbound.chat_id, "123-456@g.us");
+        assert_eq!(inbound.sender, "61400111222@s.whatsapp.net");
+        assert_eq!(inbound.auto_rejected, Some(true));
+        assert!(inbound.is_group());
+    }
+
+    #[test]
+    fn call_offer_without_caller_or_id_is_dropped() {
+        // No `from` → nowhere to route → MissingChatId.
+        let no_from = parse(r#"{"event":"call.offer","payload":{"call_id":"C"}}"#);
+        assert_eq!(
+            no_from.into_inbound().unwrap_err(),
+            DropReason::MissingChatId
+        );
+        // Has a caller but no call_id → no idempotency key → MissingId.
+        let no_id =
+            parse(r#"{"event":"call.offer","payload":{"from":"61400111222@s.whatsapp.net"}}"#);
+        assert_eq!(no_id.into_inbound().unwrap_err(), DropReason::MissingId);
     }
 
     #[test]

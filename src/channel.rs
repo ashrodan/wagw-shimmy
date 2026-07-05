@@ -149,6 +149,8 @@ mod tests {
             kind: crate::model::InboundKind::Message,
             reaction: None,
             reacted_message_id: None,
+            auto_rejected: None,
+            remote_platform: None,
         }
     }
 

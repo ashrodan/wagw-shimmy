@@ -39,6 +39,12 @@ struct InboundForward<'a> {
     /// The id of the message a reaction targets. Omitted otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
     reacted_message_id: Option<&'a str>,
+    /// On a `type:"call"`, whether GOWA already auto-rejected it. Omitted otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    auto_rejected: Option<bool>,
+    /// On a `type:"call"`, the caller's platform when known. Omitted otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    remote_platform: Option<&'a str>,
 }
 
 /// One media attachment as the agent sees it: a `type`, a fetchable `url` (back at the shim's
@@ -168,15 +174,24 @@ impl AgentClient {
         // text is prepended so the agent sees what the user was replying to, not just a bare @tag.
         let agent_body = inbound.agent_body();
         let media = self.build_forward_media(inbound);
-        // A reaction forwards a `type:"reaction"` discriminator plus the emoji and target id; a
-        // normal message omits all three (the agent sees exactly today's shape).
+        // A reaction forwards a `type:"reaction"` discriminator plus the emoji and target id; a call
+        // forwards `type:"call"` plus its metadata; a normal message omits the discriminator and all
+        // the extras (the agent sees exactly today's shape).
         let (kind, reaction, reacted_message_id) = match inbound.kind {
             crate::model::InboundKind::Reaction => (
                 Some("reaction"),
                 inbound.reaction.as_deref(),
                 inbound.reacted_message_id.as_deref(),
             ),
+            crate::model::InboundKind::Call => (Some("call"), None, None),
             crate::model::InboundKind::Message => (None, None, None),
+        };
+        // Call-only metadata: `auto_rejected` and `remote_platform` (both `None` for message/reaction).
+        let (auto_rejected, remote_platform) = match inbound.kind {
+            crate::model::InboundKind::Call => {
+                (inbound.auto_rejected, inbound.remote_platform.as_deref())
+            }
+            _ => (None, None),
         };
 
         // Debug sink: no agent target. Log the exact contract that *would* be forwarded and report
@@ -206,6 +221,8 @@ impl AgentClient {
             media,
             reaction,
             reacted_message_id,
+            auto_rejected,
+            remote_platform,
         };
 
         let response = self

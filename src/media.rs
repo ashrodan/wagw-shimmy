@@ -45,7 +45,12 @@ pub fn verify(key: &[u8], token: &str) -> Option<String> {
     mac.update(path.as_bytes());
     mac.verify_slice(&signature).ok()?;
 
-    if !path.starts_with(MEDIA_PREFIX) || path.contains("..") {
+    // Reject a path outside the media store, a literal `..` traversal, or *any* percent sign. The
+    // path is forwarded verbatim to GOWA's static file server (see `gowa::fetch_static`), which may
+    // itself percent-decode — so a signed `statics/media/%2e%2e/whatsapp.db` would pass a naive `..`
+    // check yet decode to a traversal on GOWA's side, reaching the whatsmeow session DB. Our own
+    // signer never emits a `%`, so rejecting it outright closes that decode-after-check gap.
+    if !path.starts_with(MEDIA_PREFIX) || path.contains("..") || path.contains('%') {
         return None;
     }
     Some(path)
@@ -93,5 +98,16 @@ mod tests {
         // …and a correctly-signed path outside the media dir entirely.
         let outside = sign(KEY, "etc/passwd");
         assert!(verify(KEY, &outside).is_none());
+    }
+
+    #[test]
+    fn verify_rejects_percent_encoded_traversal_even_when_signed() {
+        // A correctly-signed path whose `..` is percent-encoded passes a naive `..` check but would
+        // decode to a traversal on GOWA's static server. Rejecting any `%` closes that gap.
+        let encoded = sign(KEY, "statics/media/%2e%2e/%2e%2e/whatsapp.db");
+        assert!(verify(KEY, &encoded).is_none());
+        // A bare percent sign anywhere in an otherwise-valid path is refused too.
+        let stray = sign(KEY, "statics/media/a%2fb.jpg");
+        assert!(verify(KEY, &stray).is_none());
     }
 }
