@@ -15,6 +15,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.request
@@ -90,6 +91,45 @@ def session_lock(name: str) -> threading.Lock:
         return _session_locks.setdefault(name, threading.Lock())
 
 
+def fetch_media(url: str, filename: str | None) -> str:
+    """Download a shim media URL (bearer-gated, ephemeral) to a temp file."""
+    suffix = os.path.splitext(filename)[1] if filename else ""
+    req = urllib.request.Request(
+        url, headers={"Authorization": f"Bearer {GATEWAY_TOKEN}"}
+    )
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        fd, path = tempfile.mkstemp(prefix="wagw-media-", suffix=suffix)
+        with os.fdopen(fd, "wb") as f:
+            f.write(resp.read())
+    return path
+
+
+def send_presence(chat_id: str, action: str) -> None:
+    """Typing indicator — fire-and-forget per the contract (never blocks a turn)."""
+    data = json.dumps({"chat_id": chat_id, "phone": chat_id, "action": action}).encode()
+    req = urllib.request.Request(
+        GATEWAY_URL + "/send/chat-presence",
+        data=data,
+        headers={
+            "Authorization": f"Bearer {GATEWAY_TOKEN}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        urllib.request.urlopen(req, timeout=10).close()
+    except Exception as e:
+        log(f"presence {action} failed chat={chat_id} err={e}")
+
+
+def typing_until(chat_id: str, stop: threading.Event) -> None:
+    """Refresh 'composing' every 10s (WhatsApp auto-expires it ~25s), then stop."""
+    while not stop.is_set():
+        send_presence(chat_id, "start")
+        stop.wait(10)
+    send_presence(chat_id, "stop")
+
+
 def send_reply(chat_id: str, text: str, reply_to: str | None) -> None:
     body = {"chat_id": chat_id, "to": chat_id, "text": text, "message": text}
     if reply_to:
@@ -131,50 +171,96 @@ def run_turn(inbound: dict) -> None:
         log(f"no profile for channel={channel}; dropping")
         return
     prompt = inbound.get("body") or ""
-    media = inbound.get("media") or []
-    if media:
-        kinds = ", ".join(m.get("type", "file") for m in media)
-        prompt = (prompt + f"\n[the user attached media ({kinds}) — media is not supported on this channel yet; say so briefly if it matters to the request]").strip()
+    image_path = None
+    tmp_files: list[str] = []
+    for item in inbound.get("media") or []:
+        kind = item.get("type", "file")
+        url = item.get("url")
+        if not url:
+            continue
+        # Voice notes are transcribed by the shim (whisper) and the transcript is
+        # already folded into `body` (AGENT-WHATSAPP-CONTRACT). Hermes is text-only
+        # and can't consume the audio bytes, so there's nothing to fetch here.
+        if kind == "audio":
+            continue
+        try:
+            path = fetch_media(url, item.get("filename"))
+            tmp_files.append(path)
+        except Exception as e:
+            log(f"media fetch failed chat={chat_id} kind={kind} err={e}")
+            prompt = (prompt + f"\n[a {kind} attachment could not be fetched — mention this]").strip()
+            continue
+        if kind == "image" and image_path is None:
+            image_path = path
+            if not prompt:
+                prompt = "The user sent this image with no caption. Respond to it appropriately."
+        else:
+            name = item.get("filename") or "attachment"
+            prompt = (prompt + f"\n[the user attached a file, saved at {path} (original name: {name}) — read it with your file tools if relevant]").strip()
     if not prompt:
+        for p in tmp_files:
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
         return
     session_key = f"{wrapper}:{chat_id}"
     with session_lock(session_key):
         t0 = time.monotonic()
-        stored = get_session(session_key)
-        proc = None
-        for resume in ([stored, None] if stored else [None]):
-            cmd = [wrapper, "chat", "-Q", "-q", prompt]
-            if resume:
-                cmd[2:2] = ["--resume", resume]
-            try:
-                proc = subprocess.run(
-                    cmd, capture_output=True, text=True, timeout=TURN_TIMEOUT
-                )
-            except subprocess.TimeoutExpired:
-                log(f"turn TIMEOUT chat={chat_id} after {TURN_TIMEOUT}s")
+        typing_stop = threading.Event()
+        threading.Thread(target=typing_until, args=(chat_id, typing_stop), daemon=True).start()
+        try:
+            stored = get_session(session_key)
+            proc = None
+            for resume in ([stored, None] if stored else [None]):
+                cmd = [wrapper, "chat", "-Q", "-q", prompt]
+                if image_path:
+                    cmd += ["--image", image_path]
+                if resume:
+                    cmd[2:2] = ["--resume", resume]
+                try:
+                    proc = subprocess.run(
+                        cmd, capture_output=True, text=True, timeout=TURN_TIMEOUT
+                    )
+                except subprocess.TimeoutExpired:
+                    log(f"turn TIMEOUT chat={chat_id} after {TURN_TIMEOUT}s")
+                    return
+                combined = proc.stdout + proc.stderr
+                if resume and (proc.returncode != 0 or "No session found" in combined):
+                    log(f"stale session {resume} for chat={chat_id}; retrying fresh")
+                    continue
+                break
+            m = re.search(r"^session_id:\s*(\S+)", proc.stdout + "\n" + proc.stderr, re.MULTILINE)
+            if m:
+                set_session(session_key, m.group(1))
+            out_lines = [
+                ln
+                for ln in proc.stdout.splitlines()
+                if ln.strip() and not ln.startswith("session_id:") and not ln.lstrip().startswith("⚠")
+            ]
+            text = "\n".join(out_lines).strip()
+            log(
+                f"turn done chat={chat_id} channel={channel} profile={wrapper} "
+                f"rc={proc.returncode} secs={time.monotonic() - t0:.1f} reply_chars={len(text)}"
+            )
+            # Hermes 0.15.2 intermittently SIGABRTs at interpreter exit AFTER the
+            # turn has completed and the reply + session_id are fully printed
+            # (agent.log shows a clean "Turn ended"). Treat that as success:
+            # a captured session_id means the CLI reached its clean output stage.
+            crashed_after_output = proc.returncode != 0 and text and m
+            if crashed_after_output:
+                log(f"accepting reply despite exit rc={proc.returncode} (post-output crash)")
+            if (proc.returncode != 0 or not text) and not crashed_after_output:
+                err = proc.stderr.strip().splitlines()
+                log(f"turn stderr tail: {err[-3:] if err else '(empty)'}")
                 return
-            combined = proc.stdout + proc.stderr
-            if resume and (proc.returncode != 0 or "No session found" in combined):
-                log(f"stale session {resume} for chat={chat_id}; retrying fresh")
-                continue
-            break
-        m = re.search(r"^session_id:\s*(\S+)", proc.stdout + "\n" + proc.stderr, re.MULTILINE)
-        if m:
-            set_session(session_key, m.group(1))
-        out_lines = [
-            ln
-            for ln in proc.stdout.splitlines()
-            if ln.strip() and not ln.startswith("session_id:") and not ln.lstrip().startswith("⚠")
-        ]
-        text = "\n".join(out_lines).strip()
-        log(
-            f"turn done chat={chat_id} channel={channel} profile={wrapper} "
-            f"rc={proc.returncode} secs={time.monotonic() - t0:.1f} reply_chars={len(text)}"
-        )
-        if proc.returncode != 0 or not text:
-            err = proc.stderr.strip().splitlines()
-            log(f"turn stderr tail: {err[-3:] if err else '(empty)'}")
-            return
+        finally:
+            typing_stop.set()
+            for p in tmp_files:
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
     send_reply(chat_id, text, inbound.get("id"))
 
 
