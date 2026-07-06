@@ -115,6 +115,21 @@ WA_GROUP_CHANNELS=${WA_GROUP_CHANNELS:-}
 RUST_LOG=info
 EOF
 
+# --- in-shim voice-note transcription (optional; see src/transcribe.rs) ---
+# SHIM_TRANSCRIBE=true requires the shim binary to be built with `--features transcribe` (provision.sh
+# does this when the tenant enables it) and a MULTILINGUAL ggml model on the box. The model is
+# provisioned to /var/lib/wagw/shim/models/<file> (readable under the unit's ReadWritePaths). Language
+# defaults to `auto` (per-clip detection). Nothing is emitted when transcription is off, so today's
+# boxes are unchanged.
+if [ "${TRANSCRIBE_ENABLED:-}" = "true" ]; then
+  : "${WHISPER_MODEL:?render-env: WHISPER_MODEL (ggml filename) required when transcribe.enabled}"
+  cat >> "$ETC_DIR/wagw-shimmy.env" <<EOF
+SHIM_TRANSCRIBE=true
+SHIM_WHISPER_MODEL=/var/lib/wagw/shim/models/${WHISPER_MODEL}
+SHIM_TRANSCRIBE_LANG=${TRANSCRIBE_LANG:-auto}
+EOF
+fi
+
 # Append per-channel URL / token-file lines (nothing when WA_CHANNELS is empty).
 if [ -n "$CHANNEL_ENV" ]; then
   printf '%s' "$CHANNEL_ENV" >> "$ETC_DIR/wagw-shimmy.env"

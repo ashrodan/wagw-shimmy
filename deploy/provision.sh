@@ -56,9 +56,36 @@ fi
 sudo install -m 0755 "$tmp" /usr/local/bin/gowa
 rm -f "$tmp"
 
-# 4. Build + install the shim.
-log "building wagw-shimmy"
-( cd "$REPO" && cargo build --release --bin wagw-shimmy )
+# 4. Build + install the shim. When the tenant enables voice-note transcription, build with
+#    `--features transcribe` (pulls in whisper.cpp, which needs cmake + a C++ toolchain) and
+#    provision the multilingual ggml model to /var/lib/wagw/shim/models/. Otherwise build the thin
+#    default (no model, no C++), exactly as before.
+# transcribe.* live under the nested `transcribe:` block; pull each nested key.
+tk() { sed -n '/^transcribe:/,/^[a-z_]/p' "$REPO/deploy/tenants/${TENANT}.yaml" | grep -E "^[[:space:]]+$1:" | head -1 | sed -E "s/^[^:]*:[[:space:]]*//; s/[\"']//g"; }
+TRANSCRIBE_ENABLED="$(tk enabled)"
+WHISPER_MODEL="$(tk model)"
+WHISPER_MODEL_URL="$(tk model_url)"
+TRANSCRIBE_LANG="$(tk language)"
+
+if [ "$TRANSCRIBE_ENABLED" = "true" ]; then
+  : "${WHISPER_MODEL:?transcribe.enabled but transcribe.model (ggml filename) missing in tenant yaml}"
+  log "installing transcribe build deps (cmake + clang/libclang for whisper.cpp bindgen; libopus+pkg-config for the opus crate)"
+  sudo apt-get update -y && sudo apt-get install -y cmake clang libclang-dev pkg-config libopus-dev
+  log "building wagw-shimmy (--features transcribe)"
+  ( cd "$REPO" && cargo build --release --features transcribe --bin wagw-shimmy )
+  # Provision the multilingual ggml model (idempotent: skip if already present).
+  MODEL_DIR=/var/lib/wagw/shim/models
+  sudo install -d -o wagw -g wagw -m 0750 "$MODEL_DIR"
+  if [ ! -s "$MODEL_DIR/$WHISPER_MODEL" ]; then
+    : "${WHISPER_MODEL_URL:?transcribe.enabled but transcribe.model_url missing and model not on box}"
+    log "fetching whisper model $WHISPER_MODEL"
+    tmpm="$(mktemp)"; curl -fsSL "$WHISPER_MODEL_URL" -o "$tmpm"
+    sudo install -o wagw -g wagw -m 0640 "$tmpm" "$MODEL_DIR/$WHISPER_MODEL"; rm -f "$tmpm"
+  fi
+else
+  log "building wagw-shimmy"
+  ( cd "$REPO" && cargo build --release --bin wagw-shimmy )
+fi
 sudo install -m 0755 "$REPO/target/release/wagw-shimmy" /usr/local/bin/wagw-shimmy
 
 # 5. Build + install the agent (sibling checkout expected at ../spike-rust-agent).
@@ -90,6 +117,9 @@ sudo env \
   WA_REQUIRE_MENTION="$(y require_mention)" \
   WA_FREE_RESPONSE_CHATS="$(list free_response_chats)" \
   WA_SEND_RATE_PER_MIN="$(y send_rate_per_min)" \
+  TRANSCRIBE_ENABLED="${TRANSCRIBE_ENABLED}" \
+  WHISPER_MODEL="${WHISPER_MODEL}" \
+  TRANSCRIBE_LANG="${TRANSCRIBE_LANG}" \
   "${CHANNEL_ENV[@]}" \
   bash "$HERE/render-env.sh" "$TENANT"
 

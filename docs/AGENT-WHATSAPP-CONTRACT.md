@@ -68,6 +68,25 @@ element is:
 A media caption, when present, is folded into `body` (so a captioned image arrives as both the
 caption text and a `media[0]`). The bytes are **never** inlined into this JSON.
 
+##### Voice notes — transcript folded into `body` (optional, per-tenant)
+
+When in-shim transcription is enabled (`SHIM_TRANSCRIBE=true`; a per-tenant build with
+`--features transcribe`), the shim transcribes each inbound `audio` clip on the edge box and
+**prepends** the transcript to `body` while still emitting the audio `media[0]` (so the agent gets
+**both** the text and a fetchable URL for the original clip). The prefix is:
+
+```
+[voice note transcript (<lang>, <confidence>)]: "<transcript>"
+```
+
+e.g. `[voice note transcript (es, 0.98)]: "hola, ¿cómo estás?"`. The language is auto-detected
+per clip (whisper, ~99 languages) so the agent can reply in kind; `<confidence>` is `0.00–1.00`.
+The `(<lang>, <conf>)` annotation degrades to `(<lang>)` when the language is pinned, or is omitted
+entirely when detection is inconclusive. A clip with nothing spoken (or any transcription/decode
+failure) falls back to today's behaviour — the audio `media[]` is still forwarded, `body` unchanged.
+Transcription happens **after** the 200-ack, so it never affects GOWA's webhook timeout. Agents that
+consume audio directly can ignore the prefix and fetch `media[0].url` as before.
+
 - **Fetching the bytes:** `GET {url}` with **`Authorization: Bearer <WHATSAPP_GATEWAY_TOKEN>`** (the
   same bearer as `/send`). The shim verifies a stateless HMAC token over the GOWA-relative path and
   proxy-streams the file from GOWA, forwarding GOWA's own `Content-Type`. The agent MUST present the

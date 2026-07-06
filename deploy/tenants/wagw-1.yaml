@@ -33,6 +33,18 @@ policy:
   free_response_chats: []
   send_rate_per_min: 20
 
+# In-shim voice-note transcription (src/transcribe.rs). When enabled, the shim is built with
+# `--features transcribe` (whisper.cpp) and transcribes inbound WhatsApp voice notes on THIS box,
+# folding the transcript into the forwarded `body` (annotated with the detected language + a
+# confidence, e.g. `[voice note transcript (es, 0.98)]: "…"`) while still forwarding the audio
+# media URL. Benefits ALL channels at once (dashi/hermes/colab/default). Model is a MULTILINGUAL
+# ggml build (never a `.en` variant) so per-clip language auto-detection works.
+transcribe:
+  enabled: true
+  model: ggml-base.bin            # ~148MB multilingual; provisioned to /var/lib/wagw/shim/models/
+  model_url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin"
+  language: auto                  # per-clip auto-detect (multi-language). Pin a code to force one.
+
 # Per-group channel routing (deploy/channels-env.awk).
 # 2026-07-04: the live shim IS a channel-routing build (WA_CHANNELS=dashi,hermes confirmed on the
 # box) — the old "pre-channel-routing binary" caveat no longer applies. See docs/CHANNEL-CONNECTIONS.md §A.
@@ -60,6 +72,12 @@ channels:
     url: "https://wagw1-to-hermes.int.exe.xyz"
     token_secret: wagw-1/hermes_webhook_token  # value also in /etc/wagw-hermes-adapter.env on
                                                # bird-tortoise (WHATSAPP_WEBHOOK_TOKEN)
+  # `colab` — second Hermes profile on the SAME adapter/peerings (2026-07-05). Maps to Hermes
+  # profile "colab" (cloned from wagw: WhatsApp SOUL, Honcho memory, Exa search) via
+  # CHANNEL_PROFILES in /etc/wagw-hermes-adapter.env. Same inbound bearer as `hermes`.
+  - label: colab
+    url: "https://wagw1-to-hermes.int.exe.xyz"
+    token_secret: wagw-1/hermes_webhook_token  # shared with the hermes channel
 group_channels:
   # "Dashi by Dashlytix" — resolved 2026-06-28 from invite chat.whatsapp.com/HwmvvUoOA39FFJTQpo4XDc
   # via GOWA /group/info-from-link. A mapped group is implicitly admitted (no need to also list it in
@@ -75,6 +93,10 @@ group_channels:
   # /group/info-from-link; bot already a member (in group_allow since 2026-06-21).
   - jid: "120363408568709901@g.us"
     channel: hermes
+  # "Rodan Co-Lab" — resolved 2026-07-05 from invite chat.whatsapp.com/Djaf3IvFURW9a9ZDQwPF7j;
+  # bot already a member. Routes to the dedicated `colab` Hermes profile.
+  - jid: "61425700099-1568067834@g.us"
+    channel: colab
 
 # Downstream agent — NOT yet wired to a working spike-rust-agent.
 # AGENT_INBOUND_URL on the box currently points at the OLD Hermes agent

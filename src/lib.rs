@@ -28,5 +28,6 @@ pub mod policy;
 pub mod ratelimit;
 pub mod sent_ids;
 pub mod server;
+pub mod transcribe;
 
 pub use server::{AppState, build_router};

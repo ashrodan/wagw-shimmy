@@ -236,6 +236,13 @@ fn test_config(gowa_url: &str, agent_base: &str) -> Config {
         // alone, so its value doesn't matter to the in-process oneshot tests.
         media_base_url: "http://shim.test".into(),
         self_number: None,
+        // Transcription off by default; tests that want it inject a `MockTranscriber` into the
+        // built `AppState` (the config feature-gate/model checks only bite in `Config::from_env`).
+        transcribe: false,
+        whisper_model: None,
+        transcribe_lang: "auto".into(),
+        transcribe_max_secs: 300,
+        transcribe_max_bytes: 25 * 1024 * 1024,
     }
 }
 
@@ -1098,6 +1105,46 @@ async fn inbound_image_forwards_media_and_proxy_serves_bytes() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn inbound_voice_note_forwards_transcript_and_keeps_audio_media() {
+    // A voice note (`audio` media, no caption) with a transcriber configured: the worker fetches the
+    // clip, transcribes it, folds the transcript into `body`, and STILL forwards the audio `media[]`
+    // URL — so the agent gets transcript + audio. A `MockTranscriber` keeps `cargo test` model-free.
+    let (agent_url, agent) = spawn_mock_agent().await;
+    let (gowa_url, _gowa) = spawn_mock_gowa_media().await;
+    let mut state = state_for(&gowa_url, &agent_url).await;
+    state.transcriber = Some(Arc::new(
+        wagw_shimmy::transcribe::MockTranscriber::with_language("hola, ¿cómo estás?", "es"),
+    ));
+    let _worker = state.spawn_forward_worker();
+    let router = build_router(state);
+
+    assert_eq!(
+        post_webhook(&router, &fixture("audio_dm.json")).await,
+        StatusCode::OK
+    );
+    wait_for_hits(&agent, 1).await;
+
+    let bodies = agent.bodies.lock().await;
+    assert_eq!(bodies.len(), 1);
+    // Transcript folded into the body (the fixture carries no caption, so body == the transcript
+    // block), annotated with the mock's detected language.
+    assert_eq!(
+        bodies[0]["body"],
+        "[voice note transcript (es)]: \"hola, ¿cómo estás?\""
+    );
+    // The audio media survives: the agent still gets a fetchable /media URL for the original clip.
+    let media = &bodies[0]["media"];
+    assert_eq!(media[0]["type"], "audio");
+    assert_eq!(media[0]["mime"], "audio/ogg");
+    assert!(
+        media[0]["url"]
+            .as_str()
+            .unwrap()
+            .starts_with("http://shim.test/media/")
+    );
 }
 
 #[tokio::test]

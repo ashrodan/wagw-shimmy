@@ -1,3 +1,10 @@
+# The shim is the root package; `fleetview` (the deploy-config TUI) is a separate workspace member
+# so its ratatui/serde_yaml deps never enter the service binary. `cargo build`/`cargo test` at the
+# root still act on the shim only — build the TUI with `cargo run -p fleetview`.
+[workspace]
+members = ["fleetview"]
+resolver = "2"
+
 [package]
 name = "wagw-shimmy"
 version = "0.1.0"
@@ -28,6 +35,21 @@ base64 = "0.22"
 governor = "0.6"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# In-shim voice-note transcription (whisper.cpp). Optional + off by default so the standard
+# `cargo build`/`test`/`clippy` stay fast, network-free, and model-free; the edge box builds with
+# `--features transcribe` (see `deploy/provision.sh`). Ship a MULTILINGUAL ggml model
+# (`ggml-base.bin`/`ggml-small.bin`) — never an English-only `.en` build — so per-clip language
+# auto-detection works. `whisper-rs` loads the model + runs inference/language-detection directly
+# (real detected language + confidence). WhatsApp voice notes are Ogg/Opus: `ogg` demuxes the
+# container (pure Rust) and `opus` (libopus bindings — needs libopus + pkg-config at build time)
+# decodes packets straight to 16 kHz mono f32 (libopus resamples internally). Kept deliberately
+# minimal — no symphonia/reqwest/openssl pull-in — so the thin shim stays thin.
+whisper-rs = { version = "0.15", optional = true }
+ogg = { version = "0.9", optional = true }
+opus = { version = "0.3", optional = true }
+
+[features]
+transcribe = ["dep:whisper-rs", "dep:ogg", "dep:opus"]
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

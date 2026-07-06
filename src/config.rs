@@ -21,6 +21,11 @@ pub const DEFAULT_FORWARD_MAX_RETRIES: u32 = 5;
 pub const DEFAULT_FORWARD_CONCURRENCY: usize = 4;
 pub const DEFAULT_FORWARD_BACKOFF_MS: u64 = 1000;
 
+/// Voice-note transcription defaults (see `crate::transcribe`).
+pub const DEFAULT_TRANSCRIBE_LANG: &str = "auto";
+pub const DEFAULT_TRANSCRIBE_MAX_SECS: u32 = 300;
+pub const DEFAULT_TRANSCRIBE_MAX_BYTES: u64 = 25 * 1024 * 1024;
+
 /// Suffix of a WhatsApp DM (one-to-one) JID.
 pub const DM_SUFFIX: &str = "@s.whatsapp.net";
 /// Suffix of a WhatsApp group JID.
@@ -80,6 +85,24 @@ pub struct Config {
     /// `@<self_number>`. `None` ⇒ `@`-mention detection is off (only reply-to-bot counts as a
     /// mention).
     pub self_number: Option<String>,
+    /// Master switch for in-shim voice-note transcription (`SHIM_TRANSCRIBE`). When on, the forward
+    /// worker fetches each inbound audio clip, transcribes it (see [`crate::transcribe`]), and folds
+    /// the transcript into the forwarded `body` while still emitting the audio `media[]` URL. Off by
+    /// default; requires the `transcribe` build feature + a model (validated at boot, fail-fast).
+    pub transcribe: bool,
+    /// Path to the **multilingual** ggml whisper model on the box (`SHIM_WHISPER_MODEL`). Required
+    /// (and must exist) when `transcribe` is on. Configurable so the model can be upsized
+    /// (`base`→`small`/`medium`) without a rebuild.
+    pub whisper_model: Option<PathBuf>,
+    /// Forced transcription language, or `"auto"` for per-clip auto-detection — the multi-language
+    /// default (`SHIM_TRANSCRIBE_LANG`). Set to a fixed code only to pin a single language.
+    pub transcribe_lang: String,
+    /// Upper bound on decoded audio length fed to the model (`SHIM_TRANSCRIBE_MAX_SECS`), so a huge
+    /// clip can't pin CPU. Transcription runs post-ack, so this bounds reply latency, not GOWA.
+    pub transcribe_max_secs: u32,
+    /// Upper bound on the raw audio bytes the worker will transcribe (`SHIM_TRANSCRIBE_MAX_BYTES`);
+    /// a larger clip is forwarded audio-only (skipping transcription) rather than buffered/decoded.
+    pub transcribe_max_bytes: u64,
 }
 
 /// GOWA HTTP basic-auth pair, parsed from `user:pass`.
@@ -252,6 +275,38 @@ impl Config {
             DEFAULT_FORWARD_BACKOFF_MS,
         )?);
 
+        // --- Voice-note transcription (off by default; see `crate::transcribe`) ---
+        let transcribe = env_bool("SHIM_TRANSCRIBE");
+        let whisper_model = optional("SHIM_WHISPER_MODEL").map(PathBuf::from);
+        let transcribe_lang = env_or("SHIM_TRANSCRIBE_LANG", DEFAULT_TRANSCRIBE_LANG);
+        let transcribe_max_secs =
+            parse_u32("SHIM_TRANSCRIBE_MAX_SECS", DEFAULT_TRANSCRIBE_MAX_SECS)?;
+        let transcribe_max_bytes =
+            parse_u64("SHIM_TRANSCRIBE_MAX_BYTES", DEFAULT_TRANSCRIBE_MAX_BYTES)?;
+        if transcribe {
+            // Fail fast (matching the config's ethos): a box that asks to transcribe but can't must
+            // not boot and then silently drop voice notes. Two ways it can't: the `transcribe`
+            // feature wasn't compiled in, or the model file is missing/unset.
+            if !cfg!(feature = "transcribe") {
+                return Err(boxed(
+                    "SHIM_TRANSCRIBE is on but this binary was built without --features transcribe",
+                ));
+            }
+            match &whisper_model {
+                None => {
+                    return Err(boxed(
+                        "SHIM_TRANSCRIBE is on but SHIM_WHISPER_MODEL is not set",
+                    ));
+                }
+                Some(path) if !path.is_file() => {
+                    return Err(boxed(format!(
+                        "SHIM_WHISPER_MODEL {path:?} does not exist or is not a file"
+                    )));
+                }
+                Some(_) => {}
+            }
+        }
+
         Ok(Self {
             bind,
             gowa_url,
@@ -274,6 +329,11 @@ impl Config {
             group_channels,
             media_base_url,
             self_number,
+            transcribe,
+            whisper_model,
+            transcribe_lang,
+            transcribe_max_secs,
+            transcribe_max_bytes,
         })
     }
 }

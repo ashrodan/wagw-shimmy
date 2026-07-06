@@ -36,7 +36,10 @@ use tokio::{
 };
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
-use crate::{agent::ForwardOutcome, channel::ChannelRouter, error::DynError, model::Inbound};
+use crate::{
+    agent::ForwardOutcome, channel::ChannelRouter, error::DynError, gowa::GowaClient,
+    model::Inbound, transcribe::Transcriber,
+};
 
 /// A durable, id-keyed queue of inbound messages awaiting forward to the agent. Cheap to clone
 /// (paths plus an `Arc<Notify>`); the same handle lives in `AppState` and in the worker.
@@ -107,11 +110,16 @@ pub struct WorkerConfig {
     pub max_backoff: Duration,
     /// Safety re-drain interval, independent of the per-enqueue `Notify`.
     pub tick: Duration,
+    /// Upper bound on raw audio bytes the worker will transcribe (from `SHIM_TRANSCRIBE_MAX_BYTES`);
+    /// a larger clip is forwarded audio-only. Ignored when no transcriber is configured.
+    pub transcribe_max_bytes: u64,
 }
 
 impl WorkerConfig {
     /// The safety tick and backoff ceiling are not worth their own env vars; only the operationally
-    /// meaningful knobs (`concurrency`, `max_retries`, `base_backoff`) come from config.
+    /// meaningful knobs (`concurrency`, `max_retries`, `base_backoff`) come from config. The
+    /// transcription byte cap defaults to the config default and is overridden by the caller when it
+    /// wires up a transcriber (see `AppState::spawn_forward_worker`).
     pub fn from_parts(concurrency: usize, max_retries: u32, base_backoff: Duration) -> Self {
         Self {
             concurrency: concurrency.max(1),
@@ -119,6 +127,7 @@ impl WorkerConfig {
             base_backoff,
             max_backoff: Duration::from_secs(60),
             tick: Duration::from_secs(30),
+            transcribe_max_bytes: crate::config::DEFAULT_TRANSCRIBE_MAX_BYTES,
         }
     }
 }
@@ -133,10 +142,25 @@ pub struct ForwardWorker {
 impl ForwardWorker {
     /// Spawn the worker loop. It drains `pending/` immediately (startup recovery), then loops on the
     /// queue's `Notify` plus a periodic tick until cancelled. The `router` routes each file to its
-    /// channel's client by the persisted `Inbound.channel` label.
-    pub fn spawn(queue: ForwardQueue, router: Arc<ChannelRouter>, config: WorkerConfig) -> Self {
+    /// channel's client by the persisted `Inbound.channel` label. `gowa` fetches inbound audio bytes
+    /// and `transcriber` (when `Some`) folds a voice-note transcript into the forwarded body — both
+    /// no-ops for a message with no audio.
+    pub fn spawn(
+        queue: ForwardQueue,
+        router: Arc<ChannelRouter>,
+        gowa: GowaClient,
+        transcriber: Option<Arc<dyn Transcriber>>,
+        config: WorkerConfig,
+    ) -> Self {
         let cancel = CancellationToken::new();
-        let handle = tokio::spawn(worker_loop(queue, router, config, cancel.clone()));
+        let handle = tokio::spawn(worker_loop(
+            queue,
+            router,
+            gowa,
+            transcriber,
+            config,
+            cancel.clone(),
+        ));
         Self { cancel, handle }
     }
 
@@ -155,6 +179,8 @@ impl ForwardWorker {
 struct Worker {
     queue: ForwardQueue,
     router: Arc<ChannelRouter>,
+    gowa: GowaClient,
+    transcriber: Option<Arc<dyn Transcriber>>,
     config: WorkerConfig,
     semaphore: Arc<Semaphore>,
     /// Filenames currently being processed, so a tick/notify mid-retry can't double-spawn the same
@@ -167,6 +193,8 @@ struct Worker {
 async fn worker_loop(
     queue: ForwardQueue,
     router: Arc<ChannelRouter>,
+    gowa: GowaClient,
+    transcriber: Option<Arc<dyn Transcriber>>,
     config: WorkerConfig,
     cancel: CancellationToken,
 ) {
@@ -176,6 +204,8 @@ async fn worker_loop(
         forwards: TaskTracker::new(),
         queue,
         router,
+        gowa,
+        transcriber,
         config,
         cancel: cancel.clone(),
     };
@@ -228,6 +258,8 @@ impl Worker {
 
             let semaphore = self.semaphore.clone();
             let router = self.router.clone();
+            let gowa = self.gowa.clone();
+            let transcriber = self.transcriber.clone();
             let dead = self.queue.dead.clone();
             let config = self.config.clone();
             let cancel = self.cancel.clone();
@@ -237,7 +269,16 @@ impl Worker {
                     .acquire_owned()
                     .await
                     .expect("forward semaphore never closed");
-                process_file(&path, &router, &dead, &config, &cancel).await;
+                process_file(
+                    &path,
+                    &router,
+                    &gowa,
+                    transcriber.as_deref(),
+                    &dead,
+                    &config,
+                    &cancel,
+                )
+                .await;
                 in_flight.lock().expect("in_flight poisoned").remove(&name);
             });
         }
@@ -250,6 +291,8 @@ impl Worker {
 async fn process_file(
     path: &Path,
     router: &ChannelRouter,
+    gowa: &GowaClient,
+    transcriber: Option<&dyn Transcriber>,
     dead: &Path,
     config: &WorkerConfig,
     cancel: &CancellationToken,
@@ -263,7 +306,7 @@ async fn process_file(
             return;
         }
     };
-    let inbound: Inbound = match serde_json::from_slice(&bytes) {
+    let mut inbound: Inbound = match serde_json::from_slice(&bytes) {
         Ok(inbound) => inbound,
         Err(error) => {
             tracing::warn!(?path, %error, "unparseable pending queue file; dead-lettering");
@@ -271,6 +314,14 @@ async fn process_file(
             return;
         }
     };
+
+    // Voice notes: transcribe any inbound audio and fold the transcript into the body *before* the
+    // forward, while keeping the audio media so the agent still gets a fetchable URL. Post-ack, so
+    // STT latency never risks GOWA's 10s webhook timeout; on any error we forward the audio-only
+    // body unchanged (graceful degradation). No-op when no transcriber is configured or no audio.
+    if let Some(transcriber) = transcriber {
+        transcribe_audio(&mut inbound, gowa, transcriber, config.transcribe_max_bytes).await;
+    }
 
     // Route by the persisted channel label. A label no longer configured falls back to the default
     // client (with a warn) rather than dead-lettering — see `ChannelRouter::client_for`.
@@ -310,6 +361,70 @@ async fn process_file(
             }
         }
     }
+}
+
+/// Transcribe each inbound audio clip and prepend the transcript block(s) to `inbound.body`, leaving
+/// `inbound.media` intact so the agent still receives the audio URL. Each clip is fetched from GOWA,
+/// size-guarded, then transcribed; any failure (fetch, oversize, decode) is logged and skipped so the
+/// message is still forwarded audio-only. Runs post-ack, so its latency is off GOWA's webhook path.
+async fn transcribe_audio(
+    inbound: &mut Inbound,
+    gowa: &GowaClient,
+    transcriber: &dyn Transcriber,
+    max_bytes: u64,
+) {
+    // Collect the audio clips up front (borrow of `inbound.media` ends before we mutate `body`).
+    let audio: Vec<(String, Option<String>)> = inbound
+        .media
+        .iter()
+        .filter(|item| item.kind == "audio")
+        .map(|item| (item.gowa_path.clone(), item.mime.clone()))
+        .collect();
+    if audio.is_empty() {
+        return;
+    }
+
+    let mut blocks: Vec<String> = Vec::new();
+    for (gowa_path, mime) in &audio {
+        let fetched = match gowa.fetch_static(gowa_path).await {
+            Ok(fetched) if fetched.status.is_success() => fetched,
+            Ok(fetched) => {
+                tracing::warn!(id = %inbound.id, path = %gowa_path, status = %fetched.status, "voice-note fetch returned non-2xx; forwarding audio-only");
+                continue;
+            }
+            Err(error) => {
+                tracing::warn!(id = %inbound.id, path = %gowa_path, %error, "voice-note fetch failed; forwarding audio-only");
+                continue;
+            }
+        };
+        if fetched.body.len() as u64 > max_bytes {
+            tracing::warn!(id = %inbound.id, path = %gowa_path, bytes = fetched.body.len(), max_bytes, "voice-note exceeds SHIM_TRANSCRIBE_MAX_BYTES; forwarding audio-only");
+            continue;
+        }
+        match transcriber.transcribe(&fetched.body, mime.as_deref()).await {
+            Ok(transcript) => {
+                if let Some(block) = transcript.body_block() {
+                    tracing::info!(id = %inbound.id, path = %gowa_path, language = ?transcript.language, "voice note transcribed");
+                    blocks.push(block);
+                } else {
+                    tracing::debug!(id = %inbound.id, path = %gowa_path, "voice note transcribed to empty text; forwarding audio-only");
+                }
+            }
+            Err(error) => {
+                tracing::warn!(id = %inbound.id, path = %gowa_path, %error, "voice-note transcription failed; forwarding audio-only");
+            }
+        }
+    }
+
+    if blocks.is_empty() {
+        return;
+    }
+    let transcript_block = blocks.join("\n");
+    inbound.body = if inbound.body.trim().is_empty() {
+        transcript_block
+    } else {
+        format!("{transcript_block}\n\n{}", inbound.body)
+    };
 }
 
 /// `base * 2^attempt`, saturating and clamped to `max_backoff`.

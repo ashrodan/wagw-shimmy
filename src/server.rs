@@ -41,6 +41,7 @@ use crate::{
     policy,
     ratelimit::SendLimiter,
     sent_ids::SentIds,
+    transcribe::Transcriber,
 };
 
 /// Inbound dedup window: long enough to cover GOWA's 5× exponential-backoff retry train, short
@@ -61,6 +62,10 @@ pub struct AppState {
     pub limiter: Arc<SendLimiter>,
     /// Durable inbound→agent forward queue; the worker (spawned via `spawn_forward_worker`) drains it.
     pub queue: ForwardQueue,
+    /// Optional voice-note transcriber. `Some` when `SHIM_TRANSCRIBE` is on (and the model loaded);
+    /// the forward worker uses it to fold a transcript into the body of any inbound carrying audio.
+    /// `None` (the default) leaves today's behaviour untouched. Tests inject a `MockTranscriber`.
+    pub transcriber: Option<Arc<dyn Transcriber>>,
 }
 
 impl AppState {
@@ -71,6 +76,7 @@ impl AppState {
         let router = Arc::new(ChannelRouter::from_config(&config)?);
         let limiter = Arc::new(SendLimiter::per_minute(config.send_rate_per_min));
         let queue = ForwardQueue::new(&config.queue_dir)?;
+        let transcriber = crate::transcribe::from_config(&config)?;
         Ok(Self {
             config,
             gowa,
@@ -79,6 +85,7 @@ impl AppState {
             sent_ids: Arc::new(SentIds::new()),
             limiter,
             queue,
+            transcriber,
         })
     }
 
@@ -86,12 +93,19 @@ impl AppState {
     /// forwards each enqueued inbound to the agent with bounded retries. Returns the handle so the
     /// caller can `shutdown()` it on SIGTERM; tests may drop it (the worker keeps running).
     pub fn spawn_forward_worker(&self) -> ForwardWorker {
-        let worker_config = WorkerConfig::from_parts(
+        let mut worker_config = WorkerConfig::from_parts(
             self.config.forward_concurrency,
             self.config.forward_max_retries,
             self.config.forward_backoff,
         );
-        ForwardWorker::spawn(self.queue.clone(), self.router.clone(), worker_config)
+        worker_config.transcribe_max_bytes = self.config.transcribe_max_bytes;
+        ForwardWorker::spawn(
+            self.queue.clone(),
+            self.router.clone(),
+            self.gowa.clone(),
+            self.transcriber.clone(),
+            worker_config,
+        )
     }
 }
 
