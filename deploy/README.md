@@ -23,6 +23,10 @@ go over a single Tailscale tailnet; the data plane never leaves `127.0.0.1`.
 | `backup.sh` | restic → R2, per-tenant prefix; **SQLite-consistent** snapshot of the whatsmeow store |
 | `fleetctl` | operator CLI (run from Mac/phone): `provision` / `pair` / `list` / `status` / `rotate` / `remove` (no VM lifecycle; `add` is a back-compat alias for `provision`) |
 
+To **visualise** this config — per-number policy, channel routing, and derived config gaps — run the
+`fleetview` TUI (a workspace member, not part of the shim binary): `cargo run -p fleetview` from the
+repo root (`-- --dump` for a non-interactive text dump). See [`../fleetview/README.md`](../fleetview/README.md).
+
 ## Per-box stack
 
 ```

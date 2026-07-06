@@ -1,0 +1,16 @@
+[package]
+name = "fleetview"
+version = "0.1.0"
+edition = "2024"
+description = "Terminal admin for the wagw shim fleet — visualises the live deploy config (deploy/fleet.yaml + deploy/tenants/*.yaml): per-number policy, channel routing, and config gaps."
+license = "MIT"
+
+[[bin]]
+name = "fleetview"
+path = "src/main.rs"
+
+[dependencies]
+# ratatui re-exports crossterm, so we don't depend on it directly (avoids a version skew).
+ratatui = "0.29"
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
