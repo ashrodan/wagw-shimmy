@@ -28,9 +28,13 @@ policy:
     - "120363408568709901@g.us"   # "2 baes" — added 2026-06-21; remapped to `hermes` channel
                                   # 2026-07-05 (see group_channels; entry here is now redundant
                                   # but harmless — mapped groups are implicitly admitted)
+    - "120363429505078889@g.us"   # "Translate 🇮🇹" — added 2026-07-06 for voice-note transcription
+                                  # testing. UNMAPPED (not in group_channels) → routes to the DEFAULT
+                                  # rust agent (AGENT_INBOUND_URL). Bot joined via invite link.
   require_mention: true           # DEFAULT now true: reply only when addressed (@-tag of self_number,
                                   # or reply-to-bot). Set false only to make it answer every group message.
-  free_response_chats: []
+  free_response_chats:            # bypass require_mention here so a plain voice note (which can't
+    - "120363429505078889@g.us"   # carry an @-mention) is admitted and gets transcribed → forwarded.
   send_rate_per_min: 20
 
 # In-shim voice-note transcription (src/transcribe.rs). When enabled, the shim is built with
